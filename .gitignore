@@ -28,3 +28,9 @@ Thumbs.db
 
 # Temp
 /tmp/
+# Claude Code identity/config files (sensitive)
+AGENTS.md
+SOUL.md
+IDENTITY.md
+USER.md
+BOOTSTRAP.md
