@@ -46,9 +46,49 @@ DIALOG_ENTER_INTERVAL = 1.5  # seconds between Enter presses during startup
 PTY_ROWS = 100
 PTY_COLS = 200
 
+# ── Stagnation detection ────────────────────────────────────────────────────
+# These avoid the spinner-bypass bug where silence timeout never fires.
+STAGNATION_GROWTH_THRESHOLD = 128   # bytes: meaningful content growth floor
+STAGNATION_GROWTH_TIMEOUT = 15.0    # seconds: no meaningful growth → complete
+IDLE_TIMEOUT = 8.0                  # seconds: no PTY events + stagnant buffer → complete
+
+# ── Condition E: Effective content accumulation completion ─────────────────
+# Monitors the raw buffer for "effective content bytes" — bytes that are NOT
+# spinner ticks, ANSI cursor movements, bare whitespace, or control chars.
+# This is more sensitive than raw-byte growth because DeepSeek spinner ticks
+# (braille characters) are excluded from the count.
+EFFECTIVE_GROWTH_THRESHOLD = 32   # bytes: effective content growth floor
+EFFECTIVE_GROWTH_TIMEOUT = 10.0    # seconds: no effective growth → complete
+
+# ── Condition F: Max-wait safety net ───────────────────────────────────────
+# Absolute safety net: when SEND_TIMEOUT is reached, return whatever content
+# has been collected so far regardless of completion state.
+# This is NOT a new constant — it uses the existing SEND_TIMEOUT passed to send().
+
+# ── Reader thread watchdog ─────────────────────────────────────────────────
+READER_HEARTBEAT_INTERVAL = 5.0  # seconds between reader heartbeat updates
+
 # Prompt pattern for completion detection — these characters mark Claude's
 # ready-to-accept-input state in the PTY output.
 PROMPT_CHARS = frozenset({">", "▶", "❯"})
+
+# ── Test/output detection patterns (used in _clean_output and logging) ────
+_TRACEBACK_RE = re.compile(r"Traceback\s+\(most recent call last\):")
+_BASH_TEST_RE = re.compile(r"(python3|python)\s+-c\s+[\"']")
+_ERROR_OUTPUT_RE = re.compile(r"(Error|Exception|KeyError|ValueError|TypeError|AttributeError|ImportError|ModuleNotFoundError):")
+
+
+def _is_test_or_error_output(text: str) -> bool:
+    """Quick heuristic: check if text looks like test output or error traceback."""
+    if _TRACEBACK_RE.search(text):
+        return True
+    if _BASH_TEST_RE.search(text):
+        return True
+    # Check for common error patterns in first 200 chars
+    head = text[:200]
+    if _ERROR_OUTPUT_RE.search(head):
+        return True
+    return False
 
 
 class PtyBridge:
@@ -85,6 +125,7 @@ class PtyBridge:
         self._response_event = threading.Event()
         self._send_start_time = 0.0  # Timestamp when send() started
         self._send_start_pos = 0  # Buffer position when send() started
+        self._send_timeout_max = float("inf")  # Condition F max-wait deadline
 
         # Prompt tracking: prevent stale-prompt detection bug
         # When send() starts, we note the current buffer end and stop
@@ -93,6 +134,26 @@ class PtyBridge:
         self._prompt_seen_pos = 0  # Buffer position of last detected prompt
         self._prompt_seen_lock = threading.Lock()
         self._send_prompt_watermark = 0  # Buffer length at send() start
+
+        # Completion reason tracking: set by reader thread when it signals
+        # completion. Used in send() to add context-specific notes.
+        self._completion_reason = "unknown"
+
+        # Stagnation detection state (reader thread)
+        self._no_pollin_since = 0.0      # timestamp when PTY first stopped yielding data
+        self._stagnation_buf_len = 0      # buffer length when stagnation window started
+        self._last_growth_time = 0.0      # timestamp of last meaningful (> THRESHOLD) growth
+        self._last_growth_buf_len = 0     # buffer length at last meaningful growth event
+
+        # Condition E: Effective content accumulation (reader thread)
+        # Tracks growth of "meaningful" content only, excluding spinner ticks
+        # and ANSI cursor movements that DeepSeek produces persistently.
+        self._last_effective_content_len = 0   # effective bytes at last check
+        self._last_effective_growth_time = 0.0 # timestamp of last effective growth
+
+        # Reader thread watchdog / heartbeat
+        self._reader_heartbeat_time = 0.0   # last heartbeat timestamp
+        self._reader_heartbeat_lock = threading.Lock()
 
         # Async bridge (set during start())
         self._loop: Optional[asyncio.AbstractEventLoop] = None
@@ -131,6 +192,19 @@ class PtyBridge:
         master_fd, slave_fd = pty.openpty()
         self._set_pty_size(master_fd)
 
+        # Disable PTY echo on the master fd.
+        # Without this, typed input is echoed back into the PTY output stream,
+        # causing the completion detector to see the echo as "valid response"
+        # and triggering premature completion before Claude actually replies.
+        import termios
+        try:
+            attrs = termios.tcgetattr(master_fd)
+            # c_lflag: local mode flags
+            attrs[3] &= ~(termios.ECHO | termios.ECHOE | termios.ECHOK | termios.ECHONL)
+            termios.tcsetattr(master_fd, termios.TCSANOW, attrs)
+        except OSError:
+            logger.warning("Failed to disable PTY echo on master fd %s", master_fd)
+
         # Build claude command with optional session ID
         # No --bare flag: use normal interactive mode so Claude loads OAuth login
         # The PTY startup loop + reader thread handles dialog dismissal automatically
@@ -168,10 +242,12 @@ class PtyBridge:
         self._reader_thread.start()
 
         # Startup loop: send Enter to dismiss dialogs, wait for silence
+        # Also detects auth/consent prompts and auto-responds (#10, #11)
         deadline = time.monotonic() + START_TIMEOUT
         last_enter = 0.0
         prev_len = 0
         silent_start = None
+        _startup_prompt_detected = False
 
         while time.monotonic() < deadline:
             now = time.monotonic()
@@ -185,6 +261,20 @@ class PtyBridge:
             with self._buf_lock:
                 current_len = len(self._buffer)
 
+            # ── Detect prompt character in output (#10) ──
+            # In addition to the silence+1000-chars check, detect when Claude
+            # has reached its prompt character. This handles cases where Claude
+            # outputs a prompt without silence (e.g. after dismissing a dialog).
+            if not _startup_prompt_detected and current_len > 100:
+                with self._buf_lock:
+                    _startup_tail = self._buffer[-2048:]
+                if _startup_tail:
+                    _startup_text = _startup_tail.decode("utf-8", errors="replace")
+                    if self._check_prompt_in_text(_startup_text):
+                        _startup_prompt_detected = True
+                        logger.info("Prompt character detected during startup")
+
+            # Original silence-based detection
             if current_len > prev_len:
                 silent_start = None
             elif current_len > 1000 and silent_start is None:
@@ -193,6 +283,12 @@ class PtyBridge:
                 if now - silent_start >= SILENCE_TIMEOUT:
                     self._ready = True
                     break
+
+            # Prompt-based detection: exit startup loop early if prompt detected AND
+            # buffer is large enough (avoid false positive on tiny output)
+            if _startup_prompt_detected and current_len > 500:
+                self._ready = True
+                break
 
             prev_len = current_len
 
@@ -254,6 +350,27 @@ class PtyBridge:
 
         self._cleanup()
 
+    def reset(self):
+        """
+        Reset all internal state without touching the PTY or process.
+        Call AFTER stop() and BEFORE start() to fully reset for a /new session.
+        """
+        self._ready = False
+        self._running = False
+        with self._buf_lock:
+            self._buffer = bytearray()
+        self._send_start_pos = 0
+        self._send_prompt_watermark = 0
+        self._last_growth_time = 0.0
+        self._last_growth_buf_len = 0
+        self._last_effective_growth_time = 0.0
+        self._last_effective_content_len = 0
+        self._no_pollin_since = 0.0
+        self._stagnation_buf_len = 0
+        self._last_data_time = 0.0
+        self._expecting_response = False
+        self._response_event.clear()
+
     # ── Send / Receive ──────────────────────────────────────────────────
 
     async def send(
@@ -272,6 +389,9 @@ class PtyBridge:
             start_pos = len(self._buffer)
         self._send_start_pos = start_pos
         self._send_start_time = time.monotonic()
+        # Condition F: set max-wait threshold
+        # If timeout is 0 (unlimited), use inf; otherwise convert to elapsed-since-start
+        self._send_timeout_max = timeout if timeout > 0 else float("inf")
 
         # Set a watermark: the buffer position at send() start.
         # The reader thread will ONLY signal prompt-based completion
@@ -280,6 +400,28 @@ class PtyBridge:
         # the old prompt from a previous response immediately triggers
         # completion of the new request.
         self._send_prompt_watermark = start_pos
+        self._completion_reason = "unknown"
+
+        # ── Reset stagnation/effective tracking for fresh response ──
+        # Without this, stale state from the previous response causes
+        # premature completion: the reader thread sees "no growth" based
+        # on _last_growth_time from the last send(), even though the new
+        # request has just been written and output hasn't started yet.
+        now = time.monotonic()
+        self._last_growth_time = 0.0
+        self._last_growth_buf_len = 0
+        self._last_effective_growth_time = 0.0
+        self._last_effective_content_len = 0
+        # Reset idle tracking so Condition C doesn't fire on stale no-pollin state
+        self._no_pollin_since = 0.0
+        self._stagnation_buf_len = start_pos
+
+        # ── Log start state for diagnostics ──
+        logger.info(
+            "send() start: text_len=%d, buf_start=%d, total_buf=%d",
+            len(text), start_pos,
+            len(self._buffer) if hasattr(self, '_buffer') else 0
+        )
 
         # Setup for response tracking
         self._expecting_response = True
@@ -319,8 +461,29 @@ class PtyBridge:
         screen = VirtualScreen(rows=PTY_ROWS, cols=PTY_COLS)
         rendered = screen.render(raw)
 
+        # Log pre/post clean lengths
+        pre_clean_len = len(rendered.strip())
+
         # Clean up TUI artifacts and normalize formatting
         rendered = self._clean_output(rendered)
+
+        post_clean_len = len(rendered.strip())
+        logger.info(
+            "send() clean stats: start_pos=%d, new_bytes=%d, "
+            "pre_clean=%d, post_clean=%d, total_buf=%d",
+            start_pos, len(new_bytes),
+            pre_clean_len, post_clean_len,
+            len(self._buffer) if hasattr(self, '_buffer') else 0
+        )
+
+        # ── Log warning if output looks like test output or traceback ──
+        if rendered.strip():
+            first_500 = rendered.strip()[:500]
+            if _is_test_or_error_output(first_500):
+                logger.warning(
+                    "send() returning output that looks like test/error content (len=%d): %s",
+                    len(rendered.strip()), first_500[:300]
+                )
 
         # Safety check: if after cleaning we only got a short status line
         # (like "✻ Churned for 0s"), it means we likely captured too little
@@ -351,6 +514,16 @@ class PtyBridge:
             if fallback:
                 return fallback
 
+        # Condition F max-wait: append a note about possible incomplete content
+        if self._completion_reason == "max_wait" and cleaned:
+            elapsed_min = (time.monotonic() - self._send_start_time) / 60.0
+            note = (
+                f"\n\n---\n"
+                f"⏱️ 已等待 {elapsed_min:.0f} 分鐘，內容可能不完整。"
+                f" 如需更完整的回覆，請重發請求。"
+            )
+            cleaned = cleaned + note
+
         return cleaned
 
     # ── Reader Thread ───────────────────────────────────────────────────
@@ -360,42 +533,98 @@ class PtyBridge:
         poll = select.poll()
         poll.register(self._master_fd, select.POLLIN)
 
+        # Effective content tracking: periodically recompute effective bytes
+        # from the full buffer (expensive, so rate-limited)
+        _effective_check_counter = 0
+
         while self._running and self._master_fd is not None:
             try:
+                # ── Heartbeat ────────────────────────────────────────────────
+                with self._reader_heartbeat_lock:
+                    self._reader_heartbeat_time = time.monotonic()
+
                 events = poll.poll(250)
             except (ValueError, OSError):
+                break
+            except Exception as exc:
+                logger.error("Reader thread poll error: %s", exc, exc_info=True)
                 break
 
             now = time.monotonic()
 
             if events:
+                # Reset the no-pollin tracker — we're still getting PTY events
+                self._no_pollin_since = 0.0
                 try:
                     data = os.read(self._master_fd, 4096)
                 except (OSError, ValueError):
+                    break
+                except Exception as exc:
+                    logger.error("Reader thread read error: %s", exc, exc_info=True)
                     break
 
                 if not data:
                     logger.warning("EOF on PTY master fd — Claude process exited")
                     break
 
-                # Respond to terminal DA queries
-                respond_da(data, self._master_fd)
+                # Respond to terminal DA queries (e.g. Device Attributes, CPR)
+                try:
+                    respond_da(data, self._master_fd)
+                except Exception as exc:
+                    logger.error("Reader thread respond_da error: %s", exc, exc_info=True)
 
                 # Append to buffer
                 with self._buf_lock:
+                    old_len = len(self._buffer)
                     self._buffer.extend(data)
+                    new_len = len(self._buffer)
                 self._last_data_time = now
 
-            # Response completion: one of two conditions
-            #    Condition A: silence + minimum wait time elapsed
-            #    Condition B: prompt character detected in latest buffer chunk
-            #      (only if the prompt is NEW — appeared after send() started)
+                # Growth-based stagnation: track when buffer last grew meaningfully
+                # This catches spinner-only output where small writes (< threshold)
+                # keep coming indefinitely (spinner ticks) but no real content grows.
+                if self._expecting_response:
+                    bytes_grown = new_len - old_len
+                    if bytes_grown >= STAGNATION_GROWTH_THRESHOLD:
+                        self._last_growth_time = now
+                        with self._buf_lock:
+                            self._last_growth_buf_len = new_len
+
+            else:
+                # No data available this poll cycle
+                # Start/reset no-pollin stagnation tracking
+                if self._expecting_response:
+                    now = time.monotonic()
+                    elapsed = now - self._send_start_time
+                    if elapsed >= MIN_RESPONSE_WAIT:
+                        if self._no_pollin_since == 0.0:
+                            self._no_pollin_since = now
+                            with self._buf_lock:
+                                self._stagnation_buf_len = len(self._buffer)
+
+            # ── Response completion check ──────────────────────────────────────
+            # One of six conditions can signal completion:
+            #   A: silence + minimum wait
+            #   B: prompt detected (new content after send watermark)
+            #   C: idle (no POLLIN events + stagnant buffer)
+            #   D: growth-stagnation (no raw-byte growth above threshold)
+            #   E: effective-content accumulation (no effective content growth)
+            #   F: max-wait timeout (absolute safety net)
+            #
+            # Conditions A-D are fallbacks from the original code (useful for
+            # native Claude CLI). Conditions E and F are the primary DeepSeek
+            # fixes: E handles spinner-only output more sensitively, and F
+            # guarantees we never hang forever.
             if self._expecting_response and self._last_data_time > 0:
+                now = time.monotonic()
                 elapsed = now - self._send_start_time
                 silence = now - self._last_data_time
 
                 # Condition A: silence-based completion
-                silence_trigger = elapsed >= MIN_RESPONSE_WAIT and silence >= SILENCE_TIMEOUT
+                silence_trigger = (
+                    elapsed >= MIN_RESPONSE_WAIT
+                    and silence >= SILENCE_TIMEOUT
+                )
 
                 # Condition B: prompt-based completion
                 #    Check the last line of current buffer for prompt character
@@ -403,14 +632,135 @@ class PtyBridge:
                 #    (avoids stale-prompt race from previous response)
                 prompt_trigger = False
                 if elapsed >= 0.5:
-                    prompt_detected, prompt_pos = self._check_prompt_detected_with_pos()
-                    if prompt_detected and prompt_pos > self._send_prompt_watermark:
-                        prompt_trigger = True
+                    try:
+                        prompt_detected, prompt_pos = self._check_prompt_detected_with_pos()
+                        if prompt_detected and prompt_pos > self._send_prompt_watermark:
+                            prompt_trigger = True
+                    except Exception as exc:
+                        logger.error("Reader thread prompt detection error: %s", exc, exc_info=True)
 
-                if silence_trigger or prompt_trigger:
+                # Condition C: idle completion (stagnation detection)
+                #    Fires when:
+                #      1. No POLLIN events for >= IDLE_TIMEOUT seconds
+                #         (PTY master fd has no data to read)
+                #      2. Buffer size has not changed during that idle window
+                #         (output is genuinely stagnant — we didn't miss an event)
+                #      3. At least MIN_RESPONSE_WAIT has elapsed since send()
+                #    This catches the case where Claude finishes its output,
+                #    returns to the prompt, but the prompt is not detected
+                #    due to ANSI artifacts.
+                idle_trigger = False
+                if (
+                    elapsed >= MIN_RESPONSE_WAIT
+                    and self._no_pollin_since > 0
+                ):
+                    idle_duration = now - self._no_pollin_since
+                    if idle_duration >= IDLE_TIMEOUT:
+                        # Double-check buffer hasn't grown
+                        with self._buf_lock:
+                            current_buf_len = len(self._buffer)
+                        if current_buf_len == self._stagnation_buf_len:
+                            idle_trigger = True
+                            logger.info(
+                                "Condition C (idle) triggered after %.1fs of no PTY events "
+                                "and stagnant buffer (buf=%d b)",
+                                idle_duration, current_buf_len
+                            )
+
+                # Condition D: growth-stagnation completion
+                #    Fires when Claude's output has slowed to spinner-only garbage.
+                #    Even though PTY events keep arriving (spinner ticks),
+                #    the buffer has NOT grown by >= STAGNATION_GROWTH_THRESHOLD bytes
+                #    for STAGNATION_GROWTH_TIMEOUT seconds. This means the output
+                #    is just spinner garbage, not real content.
+                growth_trigger = False
+                if (
+                    elapsed >= MIN_RESPONSE_WAIT
+                    and self._last_growth_time > 0
+                    and (now - self._last_growth_time) >= STAGNATION_GROWTH_TIMEOUT
+                ):
+                    # Double-check buffer hasn't grown meaningfully
+                    with self._buf_lock:
+                        current_buf_len = len(self._buffer)
+                    if (current_buf_len - self._last_growth_buf_len) < STAGNATION_GROWTH_THRESHOLD:
+                        growth_trigger = True
+                        logger.info(
+                            "Condition D (growth-stagnation) after %.1fs "
+                            "(no raw growth >= %d b in %.1fs, buf=%d b)",
+                            elapsed, STAGNATION_GROWTH_THRESHOLD,
+                            STAGNATION_GROWTH_TIMEOUT, current_buf_len
+                        )
+
+                # ── Condition E: Effective content accumulation ──────────────
+                #    Unlike Condition D (raw-byte growth), this measures content
+                #    growth excluding spinner ticks, ANSI noise, and bare
+                #    whitespace/control chars. More sensitive than D because
+                #    DeepSeek spinner ticks are excluded from the byte count.
+                #    Rate-limited: recompute effective bytes every ~5 poll cycles
+                #    (~1.25s) because it requires full-buffer decode+ANSI-strip.
+                effective_trigger = False
+                _effective_check_counter += 1
+                if (
+                    elapsed >= MIN_RESPONSE_WAIT
+                    and self._last_effective_growth_time > 0
+                    and _effective_check_counter % 5 == 0
+                ):
+                    with self._buf_lock:
+                        eff_len = self._count_effective_content(bytes(self._buffer))
+                    prev_eff = self._last_effective_content_len
+                    if (eff_len - prev_eff) < EFFECTIVE_GROWTH_THRESHOLD:
+                        eff_silent = now - self._last_effective_growth_time
+                        if eff_silent >= EFFECTIVE_GROWTH_TIMEOUT:
+                            effective_trigger = True
+                            logger.info(
+                                "Condition E (effective-content) after %.1fs "
+                                "(eff_len=%d, growth=%d b in %.1fs)",
+                                elapsed, eff_len, eff_len - prev_eff, eff_silent
+                            )
+                    else:
+                        self._last_effective_content_len = eff_len
+                        self._last_effective_growth_time = now
+
+                # Initialize effective tracking on first check after send()
+                if self._last_effective_growth_time == 0.0 and elapsed >= MIN_RESPONSE_WAIT:
+                    with self._buf_lock:
+                        self._last_effective_content_len = (
+                            self._count_effective_content(bytes(self._buffer))
+                        )
+                    self._last_effective_growth_time = now
+
+                # ── Condition F: Max-wait safety net ─────────────────────────
+                #    Absolute safety net: if SEND_TIMEOUT is reached, signal
+                #    completion regardless. This ensures we never hang forever
+                #    even if ALL other conditions fail.
+                max_wait_trigger = False
+                if elapsed >= self._send_timeout_max:
+                    max_wait_trigger = True
+                    logger.warning(
+                        "Condition F (max-wait) after %.1fs — returning "
+                        "whatever content has been collected",
+                        elapsed
+                    )
+
+                if silence_trigger or prompt_trigger or idle_trigger or growth_trigger or effective_trigger or max_wait_trigger:
+                    # Record which condition triggered for diagnostic context
+                    if max_wait_trigger:
+                        self._completion_reason = "max_wait"
+                    elif effective_trigger:
+                        self._completion_reason = "effective_stagnation"
+                    elif growth_trigger:
+                        self._completion_reason = "growth_stagnation"
+                    elif idle_trigger:
+                        self._completion_reason = "idle"
+                    elif prompt_trigger:
+                        self._completion_reason = "prompt"
+                    elif silence_trigger:
+                        self._completion_reason = "silence"
                     self._response_event.set()
 
         # Reader thread exiting
+        logger.warning("Reader thread exiting (running=%s, master_fd=%s)",
+                       self._running, self._master_fd)
         self._running = False
         self._ready = False
         self._response_event.set()  # Unblock any waiter
@@ -422,14 +772,16 @@ class PtyBridge:
         The reader thread will set it again when sufficient response has been
         collected (prompt detected OR silence timeout). This avoids the race
         where the reader sets the event before _wait_for_response clears it.
+
+        timeout=0 means unlimited wait (no deadline).
         """
         start_wait = time.monotonic()
         while self._response_event.wait(timeout=1.0) is False:
             # Check if the bridge is still running
             if not self._running:
                 return False
-            # Check overall timeout
-            if time.monotonic() - start_wait >= timeout:
+            # Check overall timeout (0 = unlimited)
+            if timeout > 0 and (time.monotonic() - start_wait) >= timeout:
                 logger.warning(
                     "Response timeout after %.1fs (silence-based detection may have failed)",
                     timeout,
@@ -463,8 +815,45 @@ class PtyBridge:
         # until next ## heading or end
         suppress_summary = False
 
+        # ── Python traceback / test command block filtering ──
+        # Some residual PTY content contains "Traceback (most recent call last):"
+        # blocks or "python3 -c " test commands that were left in the buffer.
+        # These must never leak to the user. We track a "skip block" state that
+        # suppresses everything until we're clearly past the error block.
+        _skip_block = False       # True while actively skipping a traceback/test block
+        _skip_block_depth = 0     # indentation depth of block being skipped
+
         for line in lines:
             stripped = line.strip()
+
+            # ── Detect start of Python traceback block ──
+            if re.search(r"Traceback\s+\(most recent call last\):", stripped):
+                _skip_block = True
+                _skip_block_depth = len(line) - len(line.lstrip())
+                continue
+
+            # ── Detect start of bash test command block ──
+            if re.match(r"^(python3|python)\s+-c\s+[\"']", stripped):
+                _skip_block = True
+                _skip_block_depth = len(line) - len(line.lstrip())
+                continue
+
+            # ── Suppress lines inside a skip block ──
+            if _skip_block:
+                # Exit skip block when we hit a line with LESS indentation than
+                # the block start (not a continuation), OR an empty line followed
+                # by a non-traceback-looking line in the next iteration.
+                # Traceback blocks end at the line with the actual exception name
+                # which typically has less indentation than inner frames.
+                current_indent = len(line) - len(line.lstrip())
+                if current_indent < _skip_block_depth and stripped:
+                    _skip_block = False  # Exit skip mode
+                else:
+                    # Still in the error block — skip this line
+                    # Exit also on empty lines that aren't continuation
+                    if not stripped:
+                        _skip_block = False
+                    continue
 
             # ── Detect and skip spinner/braille progress lines ──
             if re.match(r"^[⠁-⣿](\s+\S+){0,4}$", stripped) and len(stripped) < 40:
@@ -472,6 +861,18 @@ class PtyBridge:
             if re.match(r"^Waiting\.\.\.?$", stripped):
                 continue
             if re.match(r"^[⠁-⣿]$", stripped):
+                continue
+
+            # ── Detect and skip auth/consent prompt menus ──
+            # When Claude asks "Do you want to proceed?" with numbered options,
+            # this is not output for the user — it's a CLI interaction.
+            # Skip these lines.
+            if re.match(r"^Do you want to proceed\?$", stripped, re.IGNORECASE):
+                # Track that we're in an auth prompt section
+                continue
+            if re.match(r"^\d+\.\s+(Yes|No|Allow|Reject|Skip)", stripped, re.IGNORECASE):
+                continue
+            if re.match(r"^Yes,\s+allow", stripped, re.IGNORECASE):
                 continue
 
             # ── Detect protocol section entry/exit ──
@@ -543,6 +944,20 @@ class PtyBridge:
             # word, has no output markers). Very conservative to avoid
             # filtering actual content.
             if (re.match(r"^>>?\s+", stripped) or re.match(r"^>\s+", stripped)) and len(stripped) < 200:
+                continue
+
+            # ── Filter Claude Code tool invocation blocks ──
+            # Claude Code CLI prints tool calls like "Bash(...)" as part of
+            # its protocol. These should NOT be shown to the user.
+            if re.match(r"^(Bash|Read|Write|Edit|Web|WebSearch|FileEdit|Pattern|Grep|Search|View)\s*\(", stripped):
+                continue
+            if re.match(r"^\s*Bash\(echo", stripped):
+                continue
+            # Filter "Contains ..." analysis lines from Claude Code TUI
+            if re.match(r"^Contains\s+(simple_expansion|literal|user_input|path|script)", stripped):
+                continue
+            # Filter question-mark menu shortcuts
+            if re.match(r"^\s*\?\s+(Tool|Command|File|Search)", stripped):
                 continue
 
             # ── Line-level filters ──
@@ -661,10 +1076,16 @@ class PtyBridge:
         """
         Check whether the last significant line of text contains a prompt character.
 
-        Uses the same prompt characters defined in PROMPT_CHARS.
+        Strips ANSI codes first so that prompt characters hidden behind or before
+        escape sequences are correctly detected. Uses PROMPT_CHARS.
         An empty or whitespace-only buffer means prompt not detected.
         """
-        stripped = text.rstrip()
+        # Critically, strip ANSI first — the raw buffer may have ANSI sequences
+        # BETWEEN or AFTER the prompt character (e.g. \x1b[?25h\u276f\x1b[?12l),
+        # so checking the raw tail would miss the prompt.
+        from output_parser import strip_ansi
+        clean = strip_ansi(text)
+        stripped = clean.rstrip()
         if not stripped:
             return False
         # Check last line for prompt character at end or as the only content
@@ -723,8 +1144,94 @@ class PtyBridge:
         # Fallback: approximate
         return True, buf_len
 
+    # ── Reader thread health ────────────────────────────────────────────
+
+    @property
+    def reader_alive(self) -> bool:
+        """Check if the reader thread is genuinely alive."""
+        thread = self._reader_thread
+        if thread is None:
+            return False
+        if not thread.is_alive():
+            return False
+        # Check heartbeat: reader should update regularly
+        with self._reader_heartbeat_lock:
+            hb = self._reader_heartbeat_time
+        if hb > 0 and (time.monotonic() - hb) > READER_HEARTBEAT_INTERVAL * 3:
+            # Heartbeat stale — reader may be stuck
+            logger.warning("Reader thread heartbeat stale (%.1fs since last update)",
+                           time.monotonic() - hb)
+            return False
+        # Check PTY fd
+        if self._master_fd is not None:
+            try:
+                os.fstat(self._master_fd)
+            except OSError:
+                logger.warning("PTY master fd %s is invalid", self._master_fd)
+                return False
+        return True
+
+    def _get_readable_buffer_tail(self, max_chars: int = 2000) -> str:
+        """
+        Get a readable (ANSI-stripped, carriage-return-processed) tail
+        of the current buffer for display purposes.
+        """
+        from output_parser import strip_ansi, process_carriage_returns
+        with self._buf_lock:
+            raw = bytes(self._buffer)
+        if not raw:
+            return ""
+        # Take the last N bytes
+        tail = raw[-min(len(raw), 8192):]
+        text = tail.decode("utf-8", errors="replace")
+        text = strip_ansi(text)
+        text = process_carriage_returns(text)
+        # Take last max_chars chars, starting from line boundary
+        if len(text) > max_chars:
+            idx = max(0, len(text) - max_chars)
+            # Try to start at a newline boundary
+            nl = text.find("\n", idx)
+            if nl >= 0 and nl < len(text) - max_chars // 2:
+                idx = nl + 1
+            text = text[idx:]
+        return text.strip()
+
+    @staticmethod
+    def _count_effective_content(buffer_data: bytes) -> int:
+        """
+        Count bytes of "effective content" in buffer, excluding:
+        - Braille spinner characters (U+2801-U+28FF) — DeepSeek spinner ticks
+        - ANSI escape sequences (esc, CSI, OSC, etc.)
+        - ANSI cursor movement sequences
+        - Bare whitespace and control characters
+
+        This is used by Condition E to detect when real output has stopped
+        even though spinner/ANSI noise keeps the raw buffer growing.
+        """
+        from output_parser import strip_ansi
+
+        text = strip_ansi(buffer_data.decode("utf-8", errors="replace"))
+
+        # Count only meaningful characters: non-whitespace, non-control,
+        # non-braille-spinner graphemes
+        count = 0
+        for ch in text:
+            cp = ord(ch)
+            if cp == 0x2800:
+                continue  # Braille blank
+            if 0x2801 <= cp <= 0x28FF:
+                continue  # Braille spinner characters
+            if cp <= 0x1F or cp == 0x7F:
+                continue  # Control characters
+            if ch.isspace() and ch not in ("\n", "\r"):
+                continue  # Non-newline whitespace (indentation artifacts)
+            if ch == "\r":
+                continue  # Carriage returns (cursor movements)
+            count += 1
+        return count
+
     def _cleanup(self):
-        """Close PTY master fd."""
+        """Close PTY master fd and reset all state."""
         self._ready = False
         self._running = False
         if self._master_fd is not None:
@@ -734,3 +1241,17 @@ class PtyBridge:
                 pass
             self._master_fd = None
         self._process = None
+        # Clear buffer so stale content from a stopped bridge never leaks
+        self._buffer = bytearray()
+        # Reset all tracking state
+        self._send_start_pos = 0
+        self._send_prompt_watermark = 0
+        self._last_growth_time = 0.0
+        self._last_growth_buf_len = 0
+        self._last_effective_growth_time = 0.0
+        self._last_effective_content_len = 0
+        self._no_pollin_since = 0.0
+        self._stagnation_buf_len = 0
+        self._last_data_time = 0.0
+        self._expecting_response = False
+        self._response_event.clear()

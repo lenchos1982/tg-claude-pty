@@ -5,20 +5,17 @@ Wants=network.target
 
 [Service]
 Type=simple
-User=claude
-WorkingDirectory=/opt/tg-claude-pty
-EnvironmentFile=/opt/tg-claude-pty/.env
+User=root
+WorkingDirectory=/root/tg-claude-pty
+EnvironmentFile=/root/tg-claude-pty/.env
+Environment=PATH=/root/.nvm/versions/node/v22.22.0/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=HOME=/root
+Environment=ANTHROPIC_BASE_URL=https://api.deepseek.com/anthropic
 ExecStart=/usr/bin/python3 bot.py
 Restart=on-failure
 RestartSec=5
-StandardOutput=journal
-StandardError=journal
-
-# Hardening
-NoNewPrivileges=true
-PrivateTmp=true
-ProtectHome=false
-ReadWritePaths=/home/claude
+StandardOutput=append:/tmp/tg-claude-pty.log
+StandardError=append:/tmp/tg-claude-pty.log
 
 [Install]
 WantedBy=multi-user.target

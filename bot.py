@@ -29,7 +29,7 @@ from pty_bridge import PtyBridge
 # ── Constants ────────────────────────────────────────────────────────────────
 
 MAX_REPLY_LENGTH = 4000
-SEND_TIMEOUT = 600.0  # 10 minutes max for a single response
+SEND_TIMEOUT = 1800.0  # 30 minutes max for a single response
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 
@@ -43,7 +43,14 @@ logger = logging.getLogger("tg-claude-pty")
 # ── Global state ─────────────────────────────────────────────────────────────
 
 bridge: Optional[PtyBridge] = None
-send_lock = asyncio.Lock()
+
+# ── Request Lock ─────────────────────────────────────────────────────────────
+# Single-user: simple asyncio.Lock serializes requests.
+# If lock is held, we return an immediate "please wait" message.
+# No complex queue needed — there's no concurrency to manage.
+
+_request_lock = asyncio.Lock()
+_request_processor_task: Optional[asyncio.Task] = None
 
 # ── Authorization ────────────────────────────────────────────────────────────
 
@@ -136,19 +143,63 @@ def _truncate_reply(text: str, max_len: int = MAX_REPLY_LENGTH) -> str:
 
 
 async def _ensure_bridge_running() -> bool:
-    """Restart the bridge if Claude process has exited."""
+    """
+    Restart the bridge if Claude process has exited or is not ready.
+
+    Performs a genuine health check:
+      1. Checks flags (is_ready, is_running)
+      2. Checks reader thread is_alive() and heartbeat
+      3. Checks PTY fd validity
+      4. If anything is wrong, fully resets the bridge
+    """
     global bridge
-    if bridge is None or not bridge.is_running:
-        logger.info("Bridge not running, starting...")
-        try:
-            loop = asyncio.get_running_loop()
-            await loop.run_in_executor(None, lambda: bridge.start(loop))
-            logger.info("Bridge started successfully")
-            return True
-        except Exception as e:
-            logger.error("Bridge start failed: %s", e)
-            return False
+    if bridge is None:
+        logger.info("Bridge is None, starting...")
+        return await _start_new_bridge()
+
+    # Check flags first (fast path)
+    if not bridge.is_ready or not bridge.is_running:
+        logger.info("Bridge not ready (ready=%s, running=%s), restarting...",
+                    bridge.is_ready, bridge.is_running)
+        return await _restart_bridge()
+
+    # Genuine health check: reader thread and PTY fd
+    try:
+        alive = bridge.reader_alive
+    except Exception as e:
+        logger.warning("Bridge reader health check failed: %s, restarting...", e)
+        return await _restart_bridge()
+
+    if not alive:
+        logger.warning("Reader thread not healthy (reader_alive=False), restarting...")
+        return await _restart_bridge()
+
     return True
+
+
+async def _start_new_bridge() -> bool:
+    """Create and start a new bridge instance."""
+    global bridge
+    bridge = PtyBridge(claude_bin=CLAUDE_BIN, session_id=SESSION_ID)
+    loop = asyncio.get_running_loop()
+    try:
+        await loop.run_in_executor(None, lambda: bridge.start(loop))
+        logger.info("New bridge started successfully")
+        return True
+    except Exception as e:
+        logger.error("Bridge start failed: %s", e)
+        return False
+
+
+async def _restart_bridge() -> bool:
+    """Restart the existing bridge (stop + start)."""
+    global bridge
+    if bridge is not None:
+        try:
+            await bridge.stop()
+        except Exception as e:
+            logger.warning("Bridge stop during restart had error: %s", e)
+    return await _start_new_bridge()
 
 
 # ── Handlers ─────────────────────────────────────────────────────────────────
@@ -203,8 +254,12 @@ async def new_command(update: Update, _context):
     global bridge
     msg = await update.message.reply_text("🔄 Resetting Claude session...")
 
-    async with send_lock:
-        await bridge.stop()
+    # Lock the processor from picking up new requests while we reset
+    await _pause_processor()
+    try:
+        if bridge is not None:
+            await bridge.stop()
+            bridge.reset()
         try:
             loop = asyncio.get_running_loop()
             await loop.run_in_executor(None, lambda: bridge.start(loop))
@@ -212,6 +267,8 @@ async def new_command(update: Update, _context):
         except Exception as e:
             logger.error("Failed to restart bridge: %s", e)
             await msg.edit_text("❌ Failed to restart Claude. Please try again later.")
+    finally:
+        _resume_processor()
 
 
 async def stop_command(update: Update, _context):
@@ -223,8 +280,11 @@ async def stop_command(update: Update, _context):
     global bridge
     msg = await update.message.reply_text("⏳ Restarting Claude...")
 
-    async with send_lock:
-        await bridge.stop()
+    await _pause_processor()
+    try:
+        if bridge is not None:
+            await bridge.stop()
+            bridge.reset()
         try:
             loop = asyncio.get_running_loop()
             await loop.run_in_executor(None, lambda: bridge.start(loop))
@@ -232,6 +292,87 @@ async def stop_command(update: Update, _context):
         except Exception as e:
             logger.error("Failed to restart bridge: %s", e)
             await msg.edit_text("❌ Failed to restart Claude. Please try again later.")
+    finally:
+        _resume_processor()
+
+
+# ── Request Processor ────────────────────────────────────────────────────────
+# Single-user: asyncio.Lock serializes requests. If lock is held, the user
+# gets an immediate "please wait" message. No queue, no drops.
+
+_processor_paused = False  # Flag to temporarily pause processing (for /new, /stop)
+
+
+def _resume_processor():
+    """Resume the request processor after a pause."""
+    global _processor_paused
+    _processor_paused = False
+    logger.info("Request processor resumed")
+
+
+async def _pause_processor():
+    """Pause the request processor temporarily."""
+    global _processor_paused
+    _processor_paused = True
+    await asyncio.sleep(0.5)
+    logger.info("Request processor paused")
+
+
+async def _process_request_in_lock(
+    prompt: str,
+    image_path: Optional[str] = None,
+) -> tuple[Optional[str], Optional[str]]:
+    """
+    Process a single request inside the lock.
+    Returns (result_text, error_message).
+    """
+    global bridge
+
+    logger.info("Processing request (text_len=%d)", len(prompt))
+
+    # Ensure bridge is running
+    ok = await _ensure_bridge_running()
+    if not ok:
+        return None, "Bridge not available"
+
+    # Send to Claude
+    reply_text = None
+    send_error = None
+    try:
+        reply_text = await bridge.send(prompt, timeout=SEND_TIMEOUT)
+    except Exception as e:
+        error_type = type(e).__name__
+        logger.error("Error during bridge.send: [%s] %s\n%s", error_type, e, traceback.format_exc())
+        send_error = error_type
+        reply_text = None
+
+    if reply_text is not None and len(reply_text) > 0:
+        reply_text = _truncate_reply(reply_text)
+        logger.info("Reply text (%d chars): %s", len(reply_text), reply_text[:1000])
+        formatted_text = _format_markdown_v2(reply_text)
+        return formatted_text, None
+
+    elif reply_text is not None and len(reply_text) == 0:
+        # Empty reply: try to extract something useful from the buffer
+        logger.warning("Reply text is empty — checking buffer for fallback content")
+        try:
+            buffer_tail = bridge._get_readable_buffer_tail(max_chars=2000)
+            if buffer_tail and len(buffer_tail) > 10:
+                logger.info("Buffer fallback (%d chars): %s", len(buffer_tail), buffer_tail[:500])
+                fallback_text = _truncate_reply(buffer_tail)
+                formatted_text = _format_markdown_v2(fallback_text)
+                return formatted_text + "\n\n_(⚠️ Task likely interrupted — content may be incomplete)_", None
+            else:
+                return None, "Claude 返回了空內容，請使用 /new 重置後再試"
+        except Exception as buf_err:
+            logger.error("Failed to get buffer fallback: %s", buf_err)
+            return None, "Claude 返回了空內容（buffer 不可用）"
+
+    else:
+        if send_error:
+            return None, f"系統錯誤：[{send_error}]，請重試或使用 /new 重置"
+        else:
+            return None, "Claude 沒有返回任何內容，可能是任務尚未完成"
 
 
 async def handle_message(update: Update, _context):
@@ -239,10 +380,15 @@ async def handle_message(update: Update, _context):
     if not _is_authorized(update):
         return  # Silently ignore unauthorized users
 
-    global bridge
-
     user_text = update.message.text.strip() if update.message.text else ""
     photo = update.message.photo
+
+    # Log incoming message content for debugging
+    logger.info(
+        "Incoming message from user %s: %s",
+        update.effective_user.id if update.effective_user else "?",
+        user_text[:200] if user_text else "(image)",
+    )
 
     # Handle images: download to temp file
     image_path: Optional[str] = None
@@ -258,9 +404,6 @@ async def handle_message(update: Update, _context):
 
     if not user_text:
         return  # Not a text/image message
-
-    await update.message.chat.send_action(action="typing")
-    processing_msg = await update.message.reply_text("⏳ Processing...")
 
     # Build prompt with optional image
     prompt = user_text
@@ -278,28 +421,32 @@ async def handle_message(update: Update, _context):
         except OSError as e:
             logger.error("Failed to read image %s: %s", image_path, e)
             prompt = f"[Image attached]\nUser message: {user_text}"
+            # Image will be cleaned up below even if we couldn't read it
 
-    # Send to Claude
-    async with send_lock:
-        # Ensure bridge is running
-        if bridge is None or not bridge.is_ready:
-            ok = await _ensure_bridge_running()
-            if not ok:
-                await processing_msg.edit_text(
-                    "😔 Sorry, I can't connect to Claude. Please try again later."
-                )
-                if image_path:
-                    try:
-                        os.unlink(image_path)
-                    except OSError:
-                        pass
-                return
+    await update.message.chat.send_action(action="typing")
 
+    # ── Try to acquire lock ──────────────────────────────────────────────
+    if _request_lock.locked():
+        logger.info("Lock already held — sending wait message")
+        await update.message.reply_text(
+            "⏳ A previous request is still being processed. Please wait..."
+        )
+        return
+
+    processing_msg = await update.message.reply_text("⏳ Processing...")
+
+    async with _request_lock:
         try:
-            reply_text = await bridge.send(prompt, timeout=SEND_TIMEOUT)
+            result_text, error_msg = await _process_request_in_lock(
+                prompt=prompt,
+                image_path=image_path,
+            )
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
-            logger.error("Error during bridge.send: %s\n%s", e, traceback.format_exc())
-            reply_text = None
+            logger.error("handle_message error: %s\n%s", e, traceback.format_exc())
+            error_msg = f"系統錯誤：[{type(e).__name__}]，請重試或使用 /new 重置"
+            result_text = None
         finally:
             # Clean up temp image file
             if image_path:
@@ -308,46 +455,86 @@ async def handle_message(update: Update, _context):
                 except OSError:
                     pass
 
-    if reply_text is None:
-        await processing_msg.edit_text(
-            "😔 Sorry, Claude didn't respond. Please try again."
-        )
-        return
-
-    reply_text = _truncate_reply(reply_text)
-    logger.info("Reply text (%d chars): %s", len(reply_text), reply_text[:1000])
-    formatted_text = _format_markdown_v2(reply_text)
-
-    try:
-        await processing_msg.edit_text(
-            formatted_text, parse_mode=ParseMode.MARKDOWN_V2,
-        )
-    except Exception as e:
-        logger.warning("MarkdownV2 parse failed, falling back to plain text: %s", e)
+    # ── Handle result ────────────────────────────────────────────────────
+    if result_text is not None:
         try:
-            await processing_msg.edit_text(reply_text)
-        except Exception as e2:
-            logger.error("Plain text fallback also failed: %s", e2)
             await processing_msg.edit_text(
-                "😔 Sorry, an error occurred formatting the reply."
+                result_text, parse_mode=ParseMode.MARKDOWN_V2,
             )
+        except Exception as e:
+            logger.warning("MarkdownV2 parse failed, falling back to plain text: %s", e)
+            from output_parser import strip_ansi
+            fallback = strip_ansi(result_text)
+            # Unescape markdown from the already-formatted result
+            fallback = fallback.replace(r"\_", "_").replace(r"\*", "*")
+            try:
+                await processing_msg.edit_text(fallback)
+            except Exception as e2:
+                logger.error("Plain text fallback also failed: %s", e2)
+                await processing_msg.edit_text(
+                    "😔 Sorry, an error occurred formatting the reply."
+                )
+    else:
+        logger.warning("Request failed: %s", error_msg)
+
+        # Build a user-facing error message with specific detail
+        if error_msg is None:
+            reply = "😔 Sorry, Claude didn't respond."
+        elif "Bridge not available" in str(error_msg):
+            reply = (
+                "😔 與 Claude 的連接異常，正在自動重連，請稍後重試\n\n"
+                "• Try `/stop` to restart Claude\n"
+                "• If this persists, the bridge may need admin attention"
+            )
+        elif "timeout" in str(error_msg).lower() or "timed out" in str(error_msg).lower():
+            reply = (
+                "⏰ Claude took too long to respond.\n\n"
+                "• Try `/stop` to restart Claude\n"
+                "• If the task is complex, break it into smaller parts"
+            )
+        elif "empty response" in str(error_msg).lower() or "空內容" in str(error_msg):
+            reply = (
+                "📭 Claude returned an empty response.\n\n"
+                "• 請使用 /new 重置後再試"
+            )
+        elif "系統錯誤" in str(error_msg) or "Claude 沒有返回" in str(error_msg):
+            reply = str(error_msg)
+        else:
+            reply = (
+                f"😔 Sorry, Claude didn't respond.\n\n"
+                f"{error_msg}"
+            )
+        try:
+            await processing_msg.edit_text(reply)
+        except Exception:
+            pass
 
 
 # ── Startup / Shutdown ──────────────────────────────────────────────────────
 
 
 async def post_init(app: Application):
-    """Start the PtyBridge after the event loop is running."""
-    global bridge
-    bridge = PtyBridge(claude_bin=CLAUDE_BIN, session_id=SESSION_ID)
+    """Start the PtyBridge after the event loop is running.
 
+    If bridge startup fails, we mark it as degraded instead of raising.
+    This prevents systemd from entering an infinite restart loop when
+    Claude Code fails to start (e.g., auth issues, network problems).
+    The _ensure_bridge_running function will retry on first user request.
+    """
+    global bridge, _request_processor_task
+
+    bridge = PtyBridge(claude_bin=CLAUDE_BIN, session_id=SESSION_ID)
     loop = asyncio.get_running_loop()
     try:
         await loop.run_in_executor(None, lambda: bridge.start(loop))
         logger.info("Claude Code PTY bridge ready")
     except Exception as e:
-        logger.error("Failed to start PTY bridge: %s", e)
-        raise
+        logger.error(
+            "Failed to start PTY bridge: %s. Bot will run in degraded mode — "
+            "bridge will be retried on first user request.", e
+        )
+        bridge._running = False
+        bridge._ready = False
 
 
 async def post_shutdown(app: Application):

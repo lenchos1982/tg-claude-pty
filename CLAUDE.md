@@ -4,6 +4,15 @@ Standalone, distributable bridge that drives Claude Code CLI through a
 pseudo-terminal (PTY). No acpx/OpenClaw dependency, no Docker, no `--print` mode.
 Works with any model backend (Anthropic API, Bedrock, Vertex, custom proxy).
 
+## 🔴 不可違反的禁令（最高優先級）
+
+1. **`.env` 中的 `TELEGRAM_BOT_TOKEN` 只能使用楚熙（ChuXi / 8608703724）的 bot token。**
+   - 嚴禁將阿雕（agent:main）、楚薇（agent:chuwei）或其他任何 agent 的 token 填入此文件。
+   - 違反此規則會導致 Telegram bot slot 被佔用，干擾其他 agent 的正常運行。
+
+2. **任何修改 `.env` 的操作都必須確保 token 屬於楚熙。**
+   - 如果不確定，先確認 token 歸屬再操作。
+
 ## Architecture
 
 ```

@@ -8,16 +8,21 @@ Handles:
   - Clean content extraction from raw PTY output
   - Spinner/braille character stripping
   - Terminal DA query responses
+
+NOTE: This PTY-based bot does NOT use ACP mode. ACP-format parsing
+functions (extract_new_content, _strip_tool_call, _strip_tool_result,
+_strip_think_block) have been removed because they are not relevant
+here. All communication goes through a real PTY terminal.
 """
 
 import re
-from typing import Optional
 
 # ── ANSI stripping ──────────────────────────────────────────────────────────
 
 _ANSI_RE = re.compile(
     r"""
     \x1b\[[0-9;]*[a-zA-Z]       # CSI sequences: \x1b[31m, \x1b[2K, etc.
+    |\x1b\[\?[0-9;]*[a-zA-Z]   # DEC private sequences: \x1b[?25h, \x1b[?12l, etc.
     |\x1b\].*?(?:\x1b\\|\x07)   # OSC sequences: \x1b]0;title\x07
     |\x1b[PX^_].*?(?:\x1b\\|$)  # DCS/SOS/PM/APC sequences
     |\x1b[\\\a78DMNEHc=><]      # Single-char ESC sequences: ST, BEL, IND, RI, NEL, etc.
@@ -124,9 +129,4 @@ def extract_content(raw_text: str) -> str:
     return text
 
 
-def extract_new_content(raw_text: str) -> str:
-    """Clean raw PTY output and strip trailing prompt."""
-    text = extract_content(raw_text)
-    # Remove trailing prompt characters
-    text = re.sub(r"\s*[❯>▶]\s*$", "", text)
-    return text.strip()
+

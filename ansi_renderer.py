@@ -67,19 +67,21 @@ class VirtualScreen:
                 continue
 
             elif ch == "\r":
-                self._col = 0
+                # Peek next char for CRLF (\r\n) vs CR alone
+                if i + 1 < len(text) and text[i + 1] == "\n":
+                    # CR+LF: go to start of next line
+                    self._col = 0
+                    self._row += 1
+                    if self._row >= self.rows:
+                        self._scroll_up()
+                    i += 1  # consume the \n too
+                else:
+                    # CR only: return to start of current line
+                    self._col = 0
             elif ch == "\n":
                 self._row += 1
                 if self._row >= self.rows:
                     self._scroll_up()
-            elif ch == "\r\n" or ch == "\n\r":
-                self._col = 0
-                self._row += 1
-                if self._row >= self.rows:
-                    self._scroll_up()
-                # Already consumed next char
-                if ch == "\r\n":
-                    i += 1
             elif ch == "\a":
                 pass  # BEL - ignore
             elif ch == "\b":
