@@ -279,7 +279,7 @@ If you're using a custom backend (Bedrock, Vertex, proxy), configure environment
 
 ```bash
 # Clone the repository
-git clone https://github.com/lenchos1982/tg-claude-pty.git
+git clone <your-repo-url>
 cd tg-claude-pty
 
 # Install Python dependencies
@@ -924,13 +924,48 @@ tg-claude-pty/
 
 ---
 
-## 10. Development & Contribution
+## 10. Known Limitations ⚠️
+
+This project works well for its intended use case, but it's important to understand its limitations:
+
+### 10.1 Terminal Echo Artifacts (Echo Bug)
+
+Occasionally, the terminal echo from the PTY is not fully filtered from Claude's responses. You may see parts of your input echoed back in the response. The output cleaning logic (`_clean_output` in `pty_bridge.py`) handles most cases, but edge cases remain — especially with longer prompts or complex command sequences.
+
+### 10.2 Interactive Prompts (Yes/No, Menus)
+
+Claude Code CLI sometimes presents interactive prompts — Yes/No confirmations, numbered menus, or multi-select options. **The PTY bridge cannot automatically respond to these.** If Claude enters an interactive prompt state, the bridge may time out or return an incomplete response.
+
+Mitigation: Use `/stop` to restart Claude, or configure `settings.local.json` to deny/direct commands that trigger interactive flows.
+
+### 10.3 Browser Auto-Open & Async Push Notifications
+
+Features that require opening a browser (OAuth flows, result URLs) or async push from Claude Code CLI are **not supported**. The bridge works synchronously through the PTY — Claude must complete its response before it's sent back to Telegram.
+
+### 10.4 No Subagent Scheduling or Memory Layer
+
+Unlike the OpenClaw ACP framework, this bridge has:
+- **No subagent system** — it's single-threaded, single-session
+- **No persistent memory layer** — no built-in RAG, vector search, or knowledge base
+- **No multi-model orchestration** — it runs whatever Claude Code CLI is configured to use
+
+### 10.5 Single-Session Architecture
+
+The bridge maintains only one Claude session at a time. If multiple Telegram users share a bot (via `ALLOWED_USER_IDS`), they share the same Claude conversation context. There is no per-user session isolation.
+
+### 10.6 No Streaming Responses
+
+Telegram supports progressive message updates, but currently the bridge waits for Claude to finish its entire response before sending it. Long-running Claude operations (file edits, extended analysis) may take several minutes.
+
+---
+
+## 11. Development & Contribution
 
 ### Development Setup
 
 ```bash
 # Clone and install
-git clone https://github.com/lenchos1982/tg-claude-pty.git
+git clone https://github.com/YOUR_USERNAME/tg-claude-pty.git
 cd tg-claude-pty
 pip install -r requirements.txt
 
@@ -987,4 +1022,4 @@ Contributions are welcome! Areas that could use improvement:
 
 ### License
 
-This project is released under the MIT License.
+This project is released under the MIT License. See [LICENSE](LICENSE) for details.

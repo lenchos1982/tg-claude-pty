@@ -28,6 +28,10 @@ Thumbs.db
 
 # Temp
 /tmp/
+*.docx
+.verify_*
+*.log
+
 # Claude Code identity/config files (sensitive)
 AGENTS.md
 SOUL.md

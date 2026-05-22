@@ -134,7 +134,7 @@ class PtyBridge:
         # Build claude command with optional session ID
         # No --bare flag: use normal interactive mode so Claude loads OAuth login
         # The PTY startup loop + reader thread handles dialog dismissal automatically
-        cmd = [self._claude_bin, "--bare"]
+        cmd = [self._claude_bin, "--settings", os.path.join(os.path.dirname(os.path.abspath(__file__)), ".claude/settings.local.json")]
         if self._session_id:
             cmd.extend(["--session-id", self._session_id])
 
@@ -440,7 +440,6 @@ class PtyBridge:
     # ── Output Cleaning ─────────────────────────────────────────────────
 
     @staticmethod
-    @staticmethod
     def _is_status_line_only(text: str) -> bool:
         """Check if stripped text is just a status/duration line."""
         return bool(
@@ -522,6 +521,29 @@ class PtyBridge:
                 if re.match(r"^\d+\s+\w+\s+for\s", stripped):
                     continue
                 continue  # suppress everything until next heading
+
+            # ── Filter out terminal echo lines ──
+            # The PTY echoes user input back as terminal echo. Common patterns:
+            #   1. "❯ <command>" — Claude CLI prompt prefix + command
+            #   2. "$ <command>" — raw shell prompt echo (no ❯ prefix)
+            #   3. Unquoted command echoed before execution in raw PTY mode
+            #
+            # These are lines where the PTY echoes the user's input back.
+            # We skip lines matching these echo patterns. Length check prevents
+            # accidentally filtering actual content.
+            if re.match(r"^❯\s+\S", stripped) and len(stripped) < 200:
+                continue
+            # Filter "$ command" / "# command" shell-prompt echoes
+            if re.match(r"^\$\s+\S", stripped) and len(stripped) < 200:
+                continue
+            if re.match(r"^#\s+\S", stripped) and len(stripped) < 200:
+                continue
+            # Filter raw bare-command echo lines: short lines that look like
+            # a shell command typed at a prompt (starts with common command
+            # word, has no output markers). Very conservative to avoid
+            # filtering actual content.
+            if (re.match(r"^>>?\s+", stripped) or re.match(r"^>\s+", stripped)) and len(stripped) < 200:
+                continue
 
             # ── Line-level filters ──
             if re.match(r"^[─\-═━]{10,}", line):
