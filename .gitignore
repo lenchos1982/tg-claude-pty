@@ -34,3 +34,10 @@ SOUL.md
 IDENTITY.md
 USER.md
 BOOTSTRAP.md
+HEARTBEAT.md
+TOOLS.md
+MEMORY.md
+
+# Runtime directories
+.claude/
+.openclaw/
