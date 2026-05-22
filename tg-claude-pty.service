@@ -1,0 +1,24 @@
+[Unit]
+Description=Telegram ↔ Claude Code PTY Bridge
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=claude
+WorkingDirectory=/opt/tg-claude-pty
+EnvironmentFile=/opt/tg-claude-pty/.env
+ExecStart=/usr/bin/python3 bot.py
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=false
+ReadWritePaths=/home/claude
+
+[Install]
+WantedBy=multi-user.target

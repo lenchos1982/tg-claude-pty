@@ -1,0 +1,30 @@
+# Secrets & configuration
+.env
+.env.local
+*.enc
+*.key
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# System
+*.log
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.sublime-*
+
+# Temp
+/tmp/
