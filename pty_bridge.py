@@ -53,6 +53,22 @@ PTY_COLS = 200
 # ready-to-accept-input state in the PTY output.
 PROMPT_CHARS = frozenset({">", "▶", "❯"})
 
+# Auth prompt patterns for auto-response in reader thread.
+# These are checked against buffer tail during response collection.
+AUTH_PATTERNS = [
+    r"Allow\s+this\s+command",
+    r"Allow\s+read",
+    r"Allow\s+write",
+    r"Approve",
+    r"Type\s+y\s+to",
+    r"\[y/N\]",
+    r"\[Y/n\]",
+    r"confirm",
+    r"Please\s+approve",
+    r"Authorize",
+    r"Do you want to continue",
+]
+
 
 class PtyBridge:
     """
@@ -112,6 +128,10 @@ class PtyBridge:
         # avoid stacking new input on an unfinished task.
         self._prompt_ready_event = threading.Event()
         self._prompt_ready_event.set()  # Ready initially (startup prompt)
+
+        # Auth prompt auto-response debounce
+        self._last_auth_response = 0.0  # timestamp of last auto-y
+        self._auth_debounce_secs = 5.0  # min seconds between auto-responses
 
         # Async bridge (set during start())
         self._loop: Optional[asyncio.AbstractEventLoop] = None
@@ -450,38 +470,11 @@ class PtyBridge:
         self._send_start_pos = start_pos
         self._send_prompt_watermark = start_pos
 
-        # ── Auth Prompt Detection (non-blocking) ────────────────────────
-        # Quickly scan the buffer tail once for auth prompts, respond if
-        # found. This is a brief synchronous scan, not a blocking loop.
-        # The allow-list in settings.local.json is the primary mechanism;
-        # this is just a safety net for prompts that slipped through.
-        auth_deadline = time.monotonic() + 15.0
-        while time.monotonic() + 0.3 < auth_deadline:
-            if not self._running:
-                break
-            with self._buf_lock:
-                tail = bytes(self._buffer[max(0, len(self._buffer) - 2048):])
-            tail_text = tail.decode("utf-8", errors="replace")
-
-            auth_patterns = [
-                r"Allow\s+this\s+command",
-                r"Type\s+y\s+to\s+approve",
-                r"Approve\s+bash\s+command",
-                r"Do you want to continue",
-                r"\[y/N\]",
-                r"\[Y/n\]",
-                r"Type\s+y\s+to",
-            ]
-            if any(re.search(p, tail_text, re.IGNORECASE) for p in auth_patterns):
-                logger.info("Auth prompt detected, auto-responding with 'y'")
-                os.write(self._master_fd, b"y\r")
-                time.sleep(0.5)
-                break
-            # Exit after first non-empty scan; the loop only retries if
-            # the buffer tail was empty — give output more time to arrive.
-            if tail_text.strip():
-                break
-            time.sleep(0.3)
+        # Auth prompt detection has been moved to the reader thread
+        # (_check_and_respond_auth). It runs continuously during
+        # response collection, so auth prompts appearing at any point
+        # in Claude's execution are handled — not just those visible
+        # in the first 15s of send().
 
         # ── Wait for Response ───────────────────────────────────────────
         loop = asyncio.get_running_loop()
@@ -569,6 +562,34 @@ class PtyBridge:
 
     # ── Reader Thread ───────────────────────────────────────────────────
 
+    def _check_and_respond_auth(self):
+        """Check buffer tail for auth prompts and auto-respond with 'y'.
+
+        Called from the reader thread during response collection.
+        Includes a 5-second debounce per-request to avoid spamming
+        'y' on repeated auth prompts within the same command chain.
+
+        Only active when _expecting_response is True (i.e. between
+        send() start and prompt detection).
+        """
+        now = time.monotonic()
+        if now - self._last_auth_response < self._auth_debounce_secs:
+            return  # Debounce: don't respond again within 5s
+
+        with self._buf_lock:
+            tail = bytes(self._buffer[-2048:])
+        if not tail:
+            return
+
+        tail_text = tail.decode("utf-8", errors="replace")
+        if any(re.search(p, tail_text, re.IGNORECASE) for p in AUTH_PATTERNS):
+            logger.info("Auth prompt detected in reader thread — auto-responding 'y'")
+            try:
+                os.write(self._master_fd, b"y\r")
+            except OSError:
+                pass
+            self._last_auth_response = now
+
     def _reader_loop(self):
         """Continuously read PTY output, respond to DA queries."""
         poll = select.poll()
@@ -607,6 +628,14 @@ class PtyBridge:
                 else:
                     self._output_burst_count = 1
                 self._last_output_burst = now
+
+                # ── Auth prompt check (reader thread, continuous) ──────
+                # Checks buffer tail for authorization prompts every time
+                # new data arrives. Handles auth prompts that appear mid-
+                # execution (e.g. 3rd sub-task needs sudo), not just those
+                # visible at send() start. 5s debounce prevents spamming.
+                if self._expecting_response:
+                    self._check_and_respond_auth()
 
             # ── Response completion detection ────────────────────────
             # Only ONE condition triggers completion:
