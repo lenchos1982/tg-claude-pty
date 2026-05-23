@@ -55,18 +55,22 @@ PROMPT_CHARS = frozenset({">", "▶", "❯"})
 
 # Auth prompt patterns for auto-response in reader thread.
 # These are checked against buffer tail during response collection.
+# IMPORTANT: patterns must be specific enough to avoid false positives
+# in normal Claude output. Generic words like "confirm" or "approve"
+# are too wide — they appear in everyday conversation and would cause
+# spurious y\r writes that derail the response flow.
 AUTH_PATTERNS = [
     r"Allow\s+this\s+command",
-    r"Allow\s+read",
-    r"Allow\s+write",
-    r"Approve",
-    r"Type\s+y\s+to",
+    r"Allow\s+(read|write|delete|execute|run)\s",
     r"\[y/N\]",
     r"\[Y/n\]",
-    r"confirm",
-    r"Please\s+approve",
-    r"Authorize",
-    r"Do you want to continue",
+    r"Type\s+y\s+to\s+approve",
+    r"Type\s+y\s+to\s+continue",
+    r"Do you want to (continue|proceed|run|allow)",
+    r"Approve\s+(bash|shell|command|this|execution)",
+    r"Please\s+approve\s+(this|the)",
+    r"Authorize\s+(this|the)\s+command",
+    r"Authorize\s+command",
 ]
 
 
@@ -571,13 +575,20 @@ class PtyBridge:
 
         Only active when _expecting_response is True (i.e. between
         send() start and prompt detection).
+
+        Scans only the most recent 1024 bytes of the buffer — enough
+        to capture a full auth prompt without re-matching old text.
         """
         now = time.monotonic()
         if now - self._last_auth_response < self._auth_debounce_secs:
             return  # Debounce: don't respond again within 5s
 
         with self._buf_lock:
-            tail = bytes(self._buffer[-2048:])
+            buf_len = len(self._buffer)
+            if buf_len == 0:
+                return
+            scan_start = max(0, buf_len - 1024)
+            tail = bytes(self._buffer[scan_start:])
         if not tail:
             return
 
