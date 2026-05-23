@@ -228,7 +228,7 @@ class PtyBridge:
         cmd = [
             self._claude_bin, "--bare",
             "--settings", settings_path,
-            "--system-prompt-file", "/root/.claude/CLAUDE.md",
+            "--system-prompt-file", "/root/chuxi/CLAUDE.md",
         ]
         if self._session_id:
             cmd.extend(["--session-id", self._session_id])
@@ -240,7 +240,10 @@ class PtyBridge:
             if not k.startswith("CLAUDE_CODE_")
             and k not in ("CLAUDECODE", "CLAUDE_AGENT_SDK_VERSION")
         }
-        # Start Claude subprocess
+        # Start Claude subprocess in isolated working directory.
+        # Using /root/chuxi/ ensures Claude never sees pty dev docs.
+        chuxi_dir = "/root/chuxi"
+        os.makedirs(chuxi_dir, exist_ok=True)
         proc = subprocess.Popen(
             cmd,
             stdin=slave_fd,
@@ -249,6 +252,7 @@ class PtyBridge:
             close_fds=True,
             preexec_fn=os.setsid,
             env=clean_env,
+            cwd=chuxi_dir,
         )
         os.close(slave_fd)
 
