@@ -232,7 +232,10 @@ class PtyBridge:
         self._set_pty_size(master_fd)
 
         # Build claude command with optional session ID
-        # --bare: minimal TUI mode (reduces ANSI clutter in PTY output)
+        # Non-bare mode: Claude loads ~/.claude/CLAUDE.md (global dev rules)
+        # in addition to --system-prompt-file. The two merge cleanly —
+        # /root/chuxi/CLAUDE.md sets output format rules, ~/.claude/CLAUDE.md
+        # sets coding discipline rules. No conflict.
         # --settings: explicitly point to project-level settings file so
         #   permissions.allow rules are loaded even in --bare mode.
         #   Without this, --bare skips project config entirely and Claude
@@ -244,7 +247,7 @@ class PtyBridge:
             "settings.local.json",
         )
         cmd = [
-            self._claude_bin, "--bare",
+            self._claude_bin,
             "--permission-mode", "auto",
             "--settings", settings_path,
             "--system-prompt-file", "/root/chuxi/CLAUDE.md",
@@ -1019,9 +1022,19 @@ class PtyBridge:
                 continue
 
             # ── TUI status bars ──
-            if re.match(r"^[⏵⏸]\S*\s+", stripped):
+            # Non-bare mode emits status bar lines like:
+            #   ⏵⏵automodeon(shift+tab to cycle)
+            #   ⏵⏵automodeon(shift+tabtocycle)  · esc to interrupt
+            #   ⏵⏵trusted  · esc to interrupt
+            # Match any line starting with ⏵ or ⏸ followed by alphanumeric
+            # status text — these are always TUI chrome, never real output.
+            if re.match(r"^[⏵⏸]\S*\s*[\(·]", stripped):
                 continue
-            if "shift+tab to cycle" in stripped:
+            if re.match(r"^[⏵⏸]\S+$", stripped):
+                continue
+            if "shift+tab" in stripped.lower():
+                continue
+            if "esc to interrupt" in stripped.lower():
                 continue
 
             # ── Protocol artifact lines ──

@@ -111,7 +111,7 @@ The key differentiator: **tg-claude-pty drives Claude Code through a real PTY**,
 │             ▼                                           │
 │  ┌──────────────────────────────────────────────────┐   │
 │  │           Claude Code CLI (subprocess)             │   │
-│  │  /usr/bin/claude --bare [--session-id XXX]        │   │
+│  │  /usr/bin/claude --permission-mode auto [--session-id XXX]  │   │
 │  │                                                   │   │
 │  │  Reads files • Edits code • Runs commands         │   │
 │  │  Answers questions • Analyzes images              │   │
@@ -188,7 +188,7 @@ The key differentiator: **tg-claude-pty drives Claude Code through a real PTY**,
 2. PtyBridge._start_pty()
    ├── pty.openpty() → (master_fd, slave_fd)
    ├── fcntl.ioctl → set PTY size (100 rows × 200 cols)
-   ├── subprocess.Popen([claude, --bare], stdin=slave_fd, stdout=slave_fd, stderr=slave_fd)
+   ├── subprocess.Popen([claude, --permission-mode auto, --settings ..., --system-prompt-file ...], stdin=slave_fd, stdout=slave_fd, stderr=slave_fd)
    ├── Close slave_fd (parent only keeps master)
    ├── Start reader_thread (daemon)
    └── Startup dialog loop:
@@ -237,10 +237,11 @@ Two complementary strategies ensure reliable response detection:
 | Requirement | Version / Notes |
 |-------------|-----------------|
 | Python | 3.10+ (tested on 3.11, 3.12) |
-| Claude Code CLI | Installed and configured (`claude` in PATH) |
+| Node.js + npm | Required to install Claude Code CLI |
+| Claude Code CLI | Installed globally via npm: `npm install -g @anthropic-ai/claude-code` |
 | Telegram Bot Token | From [@BotFather](https://t.me/BotFather) |
 | Linux / macOS | Tested on Linux (OCI, Ubuntu, Debian); macOS likely works |
-| Node.js | Required for Claude Code CLI (`npm install -g @anthropic-ai/claude-code`) |
+| API Key / Backend | Anthropic API key, or DeepSeek API key (ANTHROPIC_BASE_URL + ANTHROPIC_AUTH_TOKEN), or other compatible proxy |
 
 ---
 
@@ -259,27 +260,28 @@ Two complementary strategies ensure reliable response detection:
 2. It will reply with your user ID (a number like `123456789`)
 3. Save this for the `ALLOWED_USER_IDS` configuration
 
-### 5.3 Install Claude Code CLI
+### 5.3 Install Node.js & Claude Code CLI
 
 ```bash
-# Install globally via npm
+# Install nvm (recommended for managing Node.js versions)
+curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash
+source ~/.bashrc
+nvm install 22
+
+# Install Claude Code CLI globally via npm
 npm install -g @anthropic-ai/claude-code
 
 # Verify installation
 claude --version
-
-# Run once to authenticate (you'll need an Anthropic API key)
-claude
-# Follow the OAuth or API key setup
 ```
 
-If you're using a custom backend (Bedrock, Vertex, proxy), configure environment variables before this step (see [5.7 Model Backend Configuration](#57-model-backend-configuration)).
+Note: If you're using a custom backend (Bedrock, Vertex, proxy), configure environment variables before this step (see [5.8 Model Backend Configuration](#58-model-backend-configuration)).
 
 ### 5.4 Clone & Install the Bridge
 
 ```bash
 # Clone the repository
-git clone <your-repo-url>
+git clone <your-repo-url> tg-claude-pty
 cd tg-claude-pty
 
 # Install Python dependencies
@@ -289,7 +291,52 @@ pip install -r requirements.txt
 cp .env.example .env
 ```
 
-### 5.5 Configure Environment Variables
+### 5.5 Create the Assistant Identity Directory
+
+tg-claude-pty uses a **separate directory** for the assistant's identity and rules. This keeps the assistant's CLAUDE.md isolated from the PTY project's development files, preventing the assistant from being confused by project documentation.
+
+```bash
+# Create the assistant directory (can be anywhere)
+mkdir -p <assistant-dir>
+
+# Create the assistant's identity file
+cat > <assistant-dir>/CLAUDE.md << 'EOF'
+# Assistant Identity
+
+## Identity
+You are [Name], an AI assistant communicating via Telegram.
+
+## Behavior Rules
+
+### Output Format
+Your messages are sent via Telegram. Use plain text only.
+
+**Forbidden:**
+- Markdown tables
+- ANSI escape codes / color codes
+- Box-drawing characters
+- Status emoji (✅❌⚠️)
+- Terminal status lines (e.g. "✻ Brewed for 12s")
+- Unicode decoration characters (◆▸▹▪▫⏺┏┓┗┛)
+- Decorative divider lines (---, ===)
+
+**Required:**
+- Plain text with blank line paragraphs
+- Simple lists with - or • markers
+- Code blocks with ``` (Telegram supports markdown code blocks)
+- Concise and direct
+
+### Scope
+- Do NOT touch other agent/bot configs (.env, tokens, credentials)
+- Do NOT modify this bridge's code unless explicitly asked
+EOF
+
+# Create settings symlink so the assistant shares the PTY's permissions
+mkdir -p <assistant-dir>/.claude
+ln -s <project-dir>/.claude/settings.local.json <assistant-dir>/.claude/settings.local.json
+```
+
+### 5.6 Configure Environment Variables
 
 Edit `.env` with your actual values:
 
@@ -302,15 +349,13 @@ TELEGRAM_BOT_TOKEN=1234567890:ABCdefGHIjklmNOPqrstUVwxyz
 ALLOWED_USER_IDS=123456789,987654321
 
 # Optional: Path to claude binary (default: auto-resolved)
-# Useful if claude is not in systemd's PATH
-# CLAUDE_BIN=/home/claude/.nvm/versions/node/v20.0.0/bin/claude
+# CLAUDE_BIN=<path-to-claude>
 
 # Optional: Session ID for persistence across restarts
-# Leave empty for auto-generated sessions
 # SESSION_ID=my-persistent-session
 ```
 
-### 5.6 Run & Verify
+### 5.7 Run & Verify
 
 ```bash
 # Test the bridge
@@ -325,7 +370,7 @@ Open Telegram, find your bot, and send `/start`. Then try sending a message — 
 
 Press `Ctrl+C` to stop for now.
 
-### 5.7 Model Backend Configuration
+### 5.8 Model Backend Configuration
 
 tg-claude-pty doesn't configure Claude's model backend — it inherits whatever Claude Code CLI is configured to use. Configure Claude before running the bridge.
 
@@ -341,7 +386,19 @@ Or use the API key directly:
 export ANTHROPIC_API_KEY=sk-ant-xxxxxxxxxxxx
 ```
 
-**Option B: AWS Bedrock**
+**Option B: DeepSeek Anthropic-Compatible API**
+
+The bridge runs in non-bare mode, which requires `ANTHROPIC_AUTH_TOKEN` instead of `ANTHROPIC_API_KEY` (see FAQ for why).
+
+```bash
+export ANTHROPIC_BASE_URL=https://api.deepseek.com/anthropic
+export ANTHROPIC_AUTH_TOKEN=sk-your-deepseek-api-key
+export ANTHROPIC_MODEL=deepseek-v4-flash
+export ANTHROPIC_DEFAULT_HAIKU_MODEL=deepseek-v4-flash
+export ANTHROPIC_DEFAULT_SONNET_MODEL=deepseek-v4-flash
+```
+
+**Option C: AWS Bedrock**
 
 ```bash
 export BEDROCK_AWS_REGION=us-east-1
@@ -349,7 +406,7 @@ export BEDROCK_ACCESS_KEY_ID=AKIAxxxxxxxxxx
 export BEDROCK_SECRET_ACCESS_KEY=xxxxxxxxxxxx
 ```
 
-**Option C: GCP Vertex AI**
+**Option D: GCP Vertex AI**
 
 ```bash
 export VERTEX_PROJECT_ID=my-gcp-project
@@ -357,7 +414,7 @@ export VERTEX_LOCATION=us-central1
 # Also requires gcloud auth or service account key
 ```
 
-**Option D: Custom Proxy / Open-Source Backend**
+**Option E: Custom Proxy / Open-Source Backend**
 
 ```bash
 export ANTHROPIC_BASE_URL=https://my-proxy.example.com
@@ -366,27 +423,53 @@ export ANTHROPIC_API_KEY=sk-proxy-key-xxxxx
 
 This lets you use Claude Code with any OpenAI-compatible or Anthropic-compatible backend, including litellm, Ollama (via proxy), or your own vLLM deployment.
 
-### 5.8 Production Deployment (systemd)
+### 5.9 Production Deployment (systemd)
 
 ```bash
 # Copy project to deployment directory
-sudo mkdir -p /opt/tg-claude-pty
-sudo cp -r . /opt/tg-claude-pty/
-cd /opt/tg-claude-pty
+sudo mkdir -p <deploy-dir>
+sudo cp -r . <deploy-dir>/
+cd <deploy-dir>
 
 # Install dependencies (as the service user)
 pip install -r requirements.txt
 
 # Set up environment
-sudo cp .env /opt/tg-claude-pty/.env
-sudo chmod 600 /opt/tg-claude-pty/.env  # 🔒 Lock down secrets
+sudo cp .env <deploy-dir>/.env
+sudo chmod 600 <deploy-dir>/.env  # 🔒 Lock down secrets
 
 # Install systemd service
 sudo cp tg-claude-pty.service /etc/systemd/system/
+```
 
+**Edit the service file** to match your paths:
+
+```bash
+sudo vim /etc/systemd/system/tg-claude-pty.service
+```
+
+Make sure these values are correct:
+
+```ini
+[Service]
+WorkingDirectory=<deploy-dir>
+EnvironmentFile=<deploy-dir>/.env
+Environment=PATH=<your-node-bin-path>:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
+Environment=HOME=<home-dir>
+# For DeepSeek or custom proxy:
+Environment=ANTHROPIC_BASE_URL=https://api.deepseek.com/anthropic
+Environment=ANTHROPIC_AUTH_TOKEN=sk-your-key
+Environment=ANTHROPIC_MODEL=deepseek-v4-flash
+Environment=ANTHROPIC_DEFAULT_HAIKU_MODEL=deepseek-v4-flash
+Environment=ANTHROPIC_DEFAULT_SONNET_MODEL=deepseek-v4-flash
+```
+
+Then enable and start:
+
+```bash
 # Optionally create a dedicated user
-sudo useradd -r -s /bin/false -m -d /home/claude claude
-sudo chown -R claude:claude /opt/tg-claude-pty
+sudo useradd -r -s /bin/false -m -d <home-dir> <user>
+sudo chown -R <user>:<user> <deploy-dir>
 
 # Enable and start
 sudo systemctl daemon-reload
@@ -399,24 +482,21 @@ sudo systemctl status tg-claude-pty
 sudo journalctl -u tg-claude-pty -f
 ```
 
-For custom model backends, add environment variables to the service file:
+### 5.10 Configuring Claude Code Behavior
 
-```ini
-[Service]
-Environment="ANTHROPIC_API_KEY=sk-ant-xxxxxxxxxxxx"
-# Environment="ANTHROPIC_BASE_URL=https://my-proxy.example.com"
-# Environment="BEDROCK_AWS_REGION=us-east-1"
+tg-claude-pty runs Claude Code in **non-bare mode** so it loads `~/.claude/CLAUDE.md` (global development rules). The assistant's identity rules are loaded separately through `--system-prompt-file` pointing to `<assistant-dir>/CLAUDE.md`. Both files merge cleanly — the global rules govern coding discipline and workflow, while the assistant's rules govern output format and behavior.
+
+The complete launch command the bridge uses:
+
+```bash
+claude --permission-mode auto \
+  --settings <project-dir>/.claude/settings.local.json \
+  --system-prompt-file <assistant-dir>/CLAUDE.md
 ```
 
-Or add them to the `.env` file (recommended for cleanliness).
-
-### 5.9 Configuring Claude Code Behavior
-
-When the bridge starts Claude, it runs it with `--bare` mode, which skips Claude's project initialization. Claude loads its configuration from:
-
-- `CLAUDE.md` in the working directory — project-level instructions and safety rules
+Claude also loads configuration from:
 - `~/.claude/settings.json` and `~/.claude/settings.local.json` — user-level configuration
-- Environment variables — `ANTHROPIC_BASE_URL`, `ANTHROPIC_API_KEY`, etc.
+- Environment variables — `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`, etc.
 
 See [Section 7: Security Configuration](#7-security-configuration--risk-warnings-️) for critical guidance on these files.
 
@@ -728,22 +808,28 @@ Mitigation:
    ```
    If not found, install: `npm install -g @anthropic-ai/claude-code`
 
-2. **Is the binary path correct?**
+2. **Is Node.js installed?** Claude Code requires Node.js:
+   ```bash
+   node --version  # Should be 18+
+   ```
+   If missing, install via nvm: `curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash`
+
+3. **Is the binary path correct?**
    - For systemd, npm global bin may not be in PATH
    - Set `CLAUDE_BIN` in `.env` to the full path:
      ```bash
-     CLAUDE_BIN=/home/claude/.nvm/versions/node/v20.0.0/bin/claude
+     CLAUDE_BIN=<path-to-claude>
      ```
 
-3. **Check logs:**
+4. **Check logs:**
    ```bash
    journalctl -u tg-claude-pty -n 50
    ```
 
-4. **Test manually:**
+5. **Test manually:**
    ```bash
    # Run as the same user
-   sudo -u claude claude --bare
+   sudo -u <user> claude --permission-mode auto
    # Wait 30-60 seconds — does it show a prompt?
    ```
 
@@ -786,19 +872,23 @@ Mitigation:
 
 **Fixes:**
 
-1. **Re-authenticate:**
+1. **Re-authenticate (Anthropic API):**
    ```bash
    claude logout
    claude login  # Follow OAuth prompts
    ```
 
-2. **Check ANTHROPIC_API_KEY:**
+2. **Check your API token environment variable:**
+   - For Anthropic API: `ANTHROPIC_API_KEY`
+   - For DeepSeek / custom proxy in non-bare mode: `ANTHROPIC_AUTH_TOKEN` (see FAQ)
    ```bash
+   echo $ANTHROPIC_AUTH_TOKEN
+   # or
    echo $ANTHROPIC_API_KEY
    ```
-   If using systemd, ensure the env var is in the service file or `.env`.
+   If using systemd, ensure the env var is in the service file.
 
-3. **Multiple auth methods conflict:** If both OAuth and ANTHROPIC_API_KEY are set, one may override the other. Use one method consistently.
+3. **Multiple auth methods conflict:** If both OAuth and ANTHROPIC_API_KEY/ANTHROPIC_AUTH_TOKEN are set, one may override the other. Use one method consistently.
 
 ### "Conflict: terminated by other getUpdates request"
 
@@ -849,7 +939,7 @@ sudo systemctl restart tg-claude-pty
 ## 9. File Structure
 
 ```
-tg-claude-pty/
+<project-dir>/                        # tg-claude-pty project root
 ├── bot.py                  # Telegram bot logic
 │                           # - PTB application setup (handlers, polling)
 │                           # - Authorization check (ALLOWED_USER_IDS)
@@ -895,96 +985,112 @@ tg-claude-pty/
 │                           # - python-telegram-bot >= 20.0
 │
 ├── .env.example            # Template for .env configuration
-│                           # - Shows all possible env vars with comments
-│                           # - Safe to commit (no real secrets)
 │
 ├── .env                    # Actual environment configuration
 │                           # - Listed in .gitignore (never committed)
 │                           # - chmod 600 recommended
-│                           # - Contains TELEGRAM_BOT_TOKEN and secrets
 │
 ├── .claude/
 │   └── settings.local.json # Claude Code permissions config
-│                           # - Permissions allow list (90+ rules)
-│                           # - Bash, file, git, npm, Python, system
-│                           # - pre-authorized commands
+│                           # - Permissions allow list
 │                           # - chmod 600 recommended
 │
-├── tg-claude-pty.service   # systemd service unit
+├── tg-claude-pty.service   # systemd service unit template
 │                           # - Production deployment config
-│                           # - WorkingDirectory=/root/tg-claude-pty
-│                           # - Loads env vars from /root/tg-claude-pty/.env
-│                           # - Loads API key from EnvironmentFile
-│                           # - Includes systemd hardening options
-│
-├──
-└── README.md               # This file
-
-### 分離的楚熙目錄
-
-注意：**CLAUDE.md 不在 PTY 項目中**，而是位於獨立的 `/root/chuxi/` 目錄：
-
-```
-/root/chuxi/
-├── CLAUDE.md                 # 楚熙的身份規則（透過 --system-prompt-file 載入）
-└── .claude/
-    └── settings.local.json   # → symlink to /root/tg-claude-pty/.claude/settings.local.json
-```
-
-這樣的目的是**避免楚熙被 PTY 項目的開發文檔誤導**。CLAUDE.md 只包含楚熙的身份認知和行為規則，不含項目的技術架構說明。
-
-楚熙的啟動命令：
-```bash
-claude --bare --permission-mode auto \
-  --settings /root/tg-claude-pty/.claude/settings.local.json \
-  --system-prompt-file /root/chuxi/CLAUDE.md
-```
+│                           # - Update paths before use
 │
 ├── .gitignore              # Git exclusion rules
-│                           # - Excludes .env, __pycache__, *.pyc
-│                           # - Excludes IDE configs (.idea/, .vscode/)
-│
 └── README.md               # This file
+
+### Separate Assistant Directory
+
+The assistant's identity file (CLAUDE.md) lives in a **separate directory** — not inside the PTY project:
+
 ```
+<assistant-dir>/
+├── CLAUDE.md                 # Assistant identity rules (loaded via --system-prompt-file)
+└── .claude/
+    └── settings.local.json   # → symlink to <project-dir>/.claude/settings.local.json
+```
+
+### Why Separate Directories?
+
+This architecture keeps the assistant from seeing the PTY project's development documentation in its working directory. The assistant only knows its identity and behavior rules from `<assistant-dir>/CLAUDE.md` — no project architecture docs, no implementation details to confuse it.
+
+The assistant also loads `~/.claude/CLAUDE.md` (global development rules, loaded since the bridge runs in non-bare mode). These two CLAUDE.md files serve different purposes and don't conflict:
+- `~/.claude/CLAUDE.md` — coding discipline, git workflow, verification standards
+- `<assistant-dir>/CLAUDE.md` — assistant identity, output format, scope limitations
 
 ---
 
-## 10. Known Limitations ⚠️
+## 10. FAQ
+
+### Why no `--bare`?
+
+`--bare` mode disables Claude Code's subagent system, which is needed for complex multi-step tasks (like large refactors or extended research). Running without `--bare` gives the assistant full Claude Code capabilities.
+
+In non-bare mode, Claude also loads `~/.claude/CLAUDE.md` (global development rules), which merges with the assistant-specific rules from `--system-prompt-file`. These serve different purposes and don't conflict.
+
+### Why `ANTHROPIC_AUTH_TOKEN` instead of `ANTHROPIC_API_KEY`?
+
+Claude Code in non-bare mode reads `ANTHROPIC_AUTH_TOKEN` for API authentication and skips OAuth. Using `ANTHROPIC_AUTH_TOKEN` with `ANTHROPIC_BASE_URL` tells Claude to bypass its normal OAuth flow and connect directly to the specified endpoint — which is how we use DeepSeek's Anthropic-compatible API.
+
+If both `ANTHROPIC_API_KEY` and `ANTHROPIC_AUTH_TOKEN` are set, the behavior is undefined — use only one.
+
+### What value goes in `ANTHROPIC_AUTH_TOKEN`?
+
+Your DeepSeek API key (format: `sk-...`). Claude Code sends this as the `x-api-key` header to the Anthropic-compatible endpoint.
+
+### Why is the assistant's CLAUDE.md in a separate directory?
+
+To prevent cognitive confusion. If the assistant's working directory contains the PTY project's source code and documentation, it may accidentally interpret project internals as instructions. Keeping the assistant in a separate directory with only its identity rules ensures it focuses on the user's requests.
+
+### Can I use multiple assistants with one bridge?
+
+Not directly — one bridge instance runs one Claude session. For multiple assistants, run multiple bridge instances with different bot tokens and assistant directories.
+
+### What if Claude gets stuck on a subagent task?
+
+Use `/stop` to force-restart Claude, or wait for the timeout (10 minutes by default). Subagent tasks in non-bare mode can run longer than simple responses.
+
+---
+
+## 11. Known Limitations ⚠️
 
 This project works well for its intended use case, but it's important to understand its limitations:
 
-### 10.1 Terminal Echo Artifacts (Echo Bug)
+### 11.1 Terminal Echo Artifacts (Echo Bug)
 
 Occasionally, the terminal echo from the PTY is not fully filtered from Claude's responses. You may see parts of your input echoed back in the response. The output cleaning logic (`_clean_output` in `pty_bridge.py`) handles most cases, but edge cases remain — especially with longer prompts or complex command sequences.
 
-### 10.2 Interactive Prompts (Yes/No, Menus)
+### 11.2 Interactive Prompts (Yes/No, Menus)
 
 Claude Code CLI sometimes presents interactive prompts — Yes/No confirmations, numbered menus, or multi-select options. **The PTY bridge cannot automatically respond to these.** If Claude enters an interactive prompt state, the bridge may time out or return an incomplete response.
 
 Mitigation: Use `/stop` to restart Claude, or configure `settings.local.json` to deny/direct commands that trigger interactive flows.
 
-### 10.3 Browser Auto-Open & Async Push Notifications
+### 11.3 Browser Auto-Open & Async Push Notifications
 
 Features that require opening a browser (OAuth flows, result URLs) or async push from Claude Code CLI are **not supported**. The bridge works synchronously through the PTY — Claude must complete its response before it's sent back to Telegram.
 
-### 10.4 No Subagent Scheduling or Memory Layer
+### 11.4 No Subagent Scheduling or Memory Layer
 
 Unlike the OpenClaw ACP framework, this bridge has:
 - **No subagent system** — it's single-threaded, single-session
 - **No persistent memory layer** — no built-in RAG, vector search, or knowledge base
 - **No multi-model orchestration** — it runs whatever Claude Code CLI is configured to use
 
-### 10.5 Single-Session Architecture
+### 11.5 Single-Session Architecture
 
 The bridge maintains only one Claude session at a time. If multiple Telegram users share a bot (via `ALLOWED_USER_IDS`), they share the same Claude conversation context. There is no per-user session isolation.
 
-### 10.6 No Streaming Responses
+### 11.6 No Streaming Responses
 
 Telegram supports progressive message updates, but currently the bridge waits for Claude to finish its entire response before sending it. Long-running Claude operations (file edits, extended analysis) may take several minutes.
 
 ---
 
-## 11. Development & Contribution
+## 12. Development & Contribution
 
 ### Development Setup
 
