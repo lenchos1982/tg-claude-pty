@@ -103,18 +103,66 @@ def respond_da(data: bytes, master_fd: int) -> bool:
 
 # ── Prompt detection ────────────────────────────────────────────────────────
 
+# TUI status/decorator patterns that appear on their own line and should
+# be skipped when scanning for prompt characters. In --bare TUI mode,
+# Claude emits status lines like "⏵⏵automodeon" or "✻ Brewed for 3s"
+# that can appear AFTER the ❯ prompt, pushing it to the second-to-last
+# line. We strip these decorative lines before checking for prompt chars.
+_TUI_STATUS_LINE_RE = re.compile(
+    r"""
+    ^(?:                        # start of line
+        [⏵⏸]\S*$                # TUI mode indicator: ⏵⏵automodeon, ⏸, etc.
+        |[✻✶\*]\s+\(?(?:Brewed|Cogitated|Churned|Thought|Run|Ran)\s+for  # status lines
+        |[✻✶\*]\s*\(?\d+s.*$   # Throbber duration: ✻ (3s)
+        |^\s*$                  # empty/whitespace-only lines
+    )
+    """,
+    re.VERBOSE,
+)
+
 
 def is_prompt_detected(text: str) -> bool:
     """
-    Check if text ends with a Claude Code prompt character.
+    Check if text contains a Claude Code prompt character near the end.
 
-    Checks the last non-whitespace character for common prompt markers.
+    In --bare TUI mode, status/decorator lines (⏵⏵automodeon, ✻ Brewed for 3s)
+    can appear AFTER the ❯ prompt. This function scans the last few
+    significant lines, skipping known TUI decorators, to find the prompt.
+
+    ANSI escape sequences are stripped before checking, because Claude
+    wraps its prompt characters in formatting codes (e.g.,
+    \\x1b[1m\\x1b[35m❯\\x1b[39m\\x1b[22m) — the raw text ends with ANSI
+    codes and spaces, not the prompt character itself.
+
+    Returns True if any of the last 5 significant (non-TUI) lines contains
+    a prompt character (❯, ▶, >) after ANSI stripping.
     """
-    stripped = text.rstrip()
-    if not stripped:
+    if not text:
         return False
-    last_char = stripped[-1]
-    return last_char in ">▶❯"
+
+    # Strip ANSI first so prompt characters buried in formatting codes
+    # become visible at the end of their line.
+    text = strip_ansi(text)
+
+    # Scan the last several lines, filtering TUI decorators
+    lines = text.split("\n")
+    candidate_count = 0
+    for line in reversed(lines):
+        stripped = line.rstrip()
+        if not stripped:
+            continue
+        # Skip known TUI status/decorator lines
+        if _TUI_STATUS_LINE_RE.match(stripped):
+            continue
+        # This is a significant line — check for prompt character
+        candidate_count += 1
+        if stripped and stripped[-1] in ">▶❯":
+            return True
+        if candidate_count >= 5:
+            # Looked at 5 significant lines, no prompt found
+            return False
+
+    return False
 
 
 # ── Content extraction ──────────────────────────────────────────────────────

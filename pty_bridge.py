@@ -42,7 +42,7 @@ logger = logging.getLogger("tg-claude-pty")
 # ── Constants ───────────────────────────────────────────────────────────────
 
 STARTUP_SILENCE_TIMEOUT = 10.0  # silence during startup → ready (with >1000 bytes)
-START_TIMEOUT = 60.0  # max seconds for full startup (including dialogs)
+START_TIMEOUT = 90.0  # max seconds for full startup (including dialogs + drain)
 DEFAULT_RESPONSE_TIMEOUT = 0  # unlimited — wait indefinitely for Claude to finish
 ABSOLUTE_MAX_WAIT = 1800.0  # 30 min — hard safety cap, returns whatever is available
 DIALOG_ENTER_INTERVAL = 1.5  # seconds between Enter presses during startup
@@ -245,6 +245,7 @@ class PtyBridge:
         )
         cmd = [
             self._claude_bin, "--bare",
+            "--permission-mode", "auto",
             "--settings", settings_path,
             "--system-prompt-file", "/root/chuxi/CLAUDE.md",
         ]
@@ -285,7 +286,8 @@ class PtyBridge:
         self._reader_thread.start()
 
         # Startup loop: send Enter to dismiss dialogs, wait for silence
-        deadline = time.monotonic() + START_TIMEOUT
+        startup_start = time.monotonic()
+        deadline = startup_start + START_TIMEOUT
         last_enter = 0.0
         prev_len = 0
         silent_start = None
@@ -313,10 +315,15 @@ class PtyBridge:
 
             prev_len = current_len
 
-            # Send Enter to dismiss dialogs
+            # Send Enter to dismiss dialogs.
+            # During early startup (first 20s), also send "q" as
+            # fallback for multi-option dialogs like settings issues.
             if now - last_enter >= DIALOG_ENTER_INTERVAL:
                 try:
-                    os.write(master_fd, b"\r")
+                    if now - startup_start < 20.0:
+                        os.write(master_fd, b"q\r")
+                    else:
+                        os.write(master_fd, b"\r")
                 except OSError:
                     break
                 last_enter = now
@@ -327,6 +334,31 @@ class PtyBridge:
             raise RuntimeError(
                 f"Claude did not show prompt within {START_TIMEOUT}s timeout"
             )
+
+        # Post-startup: Claude may still be flushing residual output
+        # (settings issue summaries, doctor results).  Wait for the
+        # output to settle, then send Enter to get a clean prompt.
+        # The silence check above already confirmed ~10s of quiescence,
+        # so we just need a brief drain here.
+        drain_deadline = time.monotonic() + 5.0
+        prev_len = 0
+        while time.monotonic() < drain_deadline:
+            time.sleep(0.3)
+            with self._buf_lock:
+                cur_len = len(self._buffer)
+            if cur_len > prev_len:
+                prev_len = cur_len
+                continue
+            if cur_len == prev_len and prev_len > 0:
+                # Output has settled — send Enter for fresh prompt
+                try:
+                    os.write(master_fd, b"\r")
+                except OSError:
+                    break
+                time.sleep(1.0)
+                break
+        # Mark the clean buffer position for future send() calls
+        self._send_prompt_watermark = len(self._buffer)
 
     async def stop(self):
         """Stop Claude Code gracefully: SIGINT → SIGTERM → SIGKILL."""
@@ -437,10 +469,12 @@ class PtyBridge:
         os.write(self._master_fd, (text + "\r").encode())
 
         # ── Echo Skip Phase ────────────────────────────────────────────
-        # Terminal echoes user input. We wait a brief moment for the echo
-        # to appear in the buffer, then advance start_pos past it so the
-        # VirtualScreen render doesn't include it in the response.
-        echo_skip_deadline = time.monotonic() + 3.0
+        # Terminal echoes user input. We wait for the echo to appear in
+        # the buffer, then advance start_pos past it so the VirtualScreen
+        # render doesn't include it in the response.
+        # 15-second window: Claude --bare mode may take several seconds
+        # to render the input display (especially with large context).
+        echo_skip_deadline = time.monotonic() + 15.0
         echo_skipped = False
         while time.monotonic() < echo_skip_deadline:
             if not self._running:
@@ -473,6 +507,18 @@ class PtyBridge:
         # Update send tracking with potentially adjusted start_pos
         self._send_start_pos = start_pos
         self._send_prompt_watermark = start_pos
+
+        # ── Re-clear response event after echo skip ────────────────────
+        # The reader thread runs independently and may have detected a
+        # prompt character in the echo output (e.g., "❯ 你好") and set
+        # _response_event during the echo skip phase. If we proceed to
+        # _wait_for_response with the event already set, it returns
+        # immediately with an empty response — the user sees only their
+        # own text echoed back while Claude is still thinking.
+        #
+        # Re-clearing here ensures only prompts appearing AFTER this
+        # point (Claude's real post-response prompt) trigger completion.
+        self._response_event.clear()
 
         # Auth prompt detection has been moved to the reader thread
         # (_check_and_respond_auth). It runs continuously during
@@ -536,8 +582,11 @@ class PtyBridge:
                 from output_parser import extract_content
                 fallback = extract_content(raw)
                 fallback = re.sub(r"\s*[❯>▶]\s*$", "", fallback).strip()
+                # Apply filtering to fallback too — extract_content is bare
                 if fallback and len(fallback) > len(cleaned):
-                    return fallback
+                    fallback = self._clean_output(fallback)
+                    if fallback.strip():
+                        return fallback.strip()
 
         if cleaned and len(cleaned) < 40 and self._is_status_line_only(cleaned):
             logger.warning(
@@ -559,8 +608,11 @@ class PtyBridge:
                     continue
                 fallback_lines.append(fl)
             fallback = "\n".join(fallback_lines).strip()
+            # Apply _clean_output filtering to the fallback result too
             if fallback:
-                return fallback
+                fallback = self._clean_output(fallback)
+                if fallback.strip():
+                    return fallback.strip()
 
         return cleaned
 
@@ -676,14 +728,28 @@ class PtyBridge:
 
                 # Prompt-based completion: only trigger if prompt
                 # appeared in content written AFTER send() started.
-                prompt_trigger = False
+                #
+                # The re-clear of _response_event after echo skip (in send())
+                # ensures that prompt characters from the echo display line
+                # (e.g., "❯ 你好") do NOT trigger premature completion.
+                #
+                # CRITICAL: Claude --bare mode redraws its TUI frequently
+                # during a response, showing the prompt character multiple
+                # times before completion. To prevent premature cutoffs,
+                # we require a quiet period AFTER prompt detection before
+                # signalling completion. If new data arrives during the
+                # quiet window, the timer resets.
                 if elapsed >= 0.5:
                     prompt_detected, prompt_pos = self._check_prompt_detected_with_pos()
                     if prompt_detected and prompt_pos > self._send_prompt_watermark:
-                        prompt_trigger = True
-
-                if prompt_trigger:
-                    self._response_event.set()
+                        # Prompt seen. Must have a stable quiet period
+                        # (no new PTY output) before we accept completion.
+                        quiet_needed = 2.0  # seconds of silence after prompt
+                        if self._last_data_time > 0:
+                            silence = now - self._last_data_time
+                            if silence >= quiet_needed:
+                                self._response_event.set()
+                            # else: prompt seen but data still arriving — keep waiting
 
             # ── Prompt-ready detection (for input-stacking prevention) ──
             # Set prompt_ready_event when Claude shows its prompt AND we
@@ -736,30 +802,87 @@ class PtyBridge:
     def _is_status_line_only(text: str) -> bool:
         """Check if stripped text is just a status/duration line."""
         return bool(
-            re.search(r"(✻|✶|\*)\s+(Brewed|Cogitated|Churned|Thought|Run|Ran)\s+for", text)
+            re.search(r"(✻|✶|\*|✽|✢|✦|✧)\s+(Brewed|Cogitated|Churned|Thought|Run|Ran|Worked)\s+for", text)
             or re.match(r"^Found\s+\d+\s+settings\s+issues", text)
             or re.match(r"^⚠️\s+", text)
         )
 
-    @staticmethod
-    def _clean_output(rendered: str) -> str:
-        """Clean up TUI artifacts, protocol sections, and normalize formatting."""
-        lines = rendered.split("\n")
-        # Keep a copy of early-pass lines for the safety fallback below
-        _all_lines = list(lines)
-        filtered = []
+    # ── Characters of interest for filtering ────────────────────────
 
-        # Protocol section tracking: skip everything between "## Protocol"
-        # and the next top-level section heading.
+    # Box-drawing characters (single, double, heavy, mixed, block elements)
+    _BOX_DRAWING_CHARS = frozenset(
+        "┌┐└┘├┤┬┴┼│─═╭╮╰╯"   # single + double horizontal
+        "╔╗╚╝╠╣╦╩╬"       # double-line box drawing
+        "┣┫┳┻╋"           # heavy/vertical variants
+        "┏┓┗┛"            # heavy box
+        "┃┆┇┈┉┊┋"           # light vertical/dashed border
+        "█▀▄▌▐░▒▓"         # block elements
+    )
+
+    # Horizontal-rule characters (repeating these = a separator line)
+    _HR_CHARS = frozenset("─━═➖‐‑‒–—―▔▀-_=")
+
+    # Purely decorative / TUI ornament characters
+    _DECORATIVE_CHARS = frozenset(
+        "◆◇▸▹▪▫▴▾◂⬤●○◎◉◈⬡⬢⬣▶▷▲▼◀◁"
+        "⏵⏸🔃🔄⏳⏺✅❌⚠️🎯🏃📋📝"
+        "⏎↩↵←↑→↓↔↕"
+    )
+
+    # ⸻ P0 · Code-block protection ────────────────────────────────────
+
+    @classmethod
+    def _clean_output(cls, rendered: str) -> str:
+        """Clean up TUI artifacts, protocol sections, and normalize formatting.
+
+        Code blocks (``` ... ```) are extracted BEFORE any filtering and
+        reinserted AFTER to prevent damage to indentation, box characters,
+        and formatting that legitimately belongs in code output.
+        """
+        lines = rendered.split("\n")
+        _all_lines = list(lines)  # safety fallback copy
+
+        # ═══ Phase 0: code-block extraction ═══
+        code_blocks: list[str] = []
+        placeholders: list[str] = []
+        _in_fence = False
+        _fence_lines: list[str] = []
+        _non_fence_lines: list[str] = []
+        for line in lines:
+            if line.startswith("```"):
+                if not _in_fence:
+                    # Entering code block
+                    _in_fence = True
+                    _fence_lines = [line]
+                else:
+                    # Exiting code block
+                    _fence_lines.append(line)
+                    code_blocks.append("\n".join(_fence_lines))
+                    placeholder = f"__CODEBLOCK_{len(placeholders)}__"
+                    placeholders.append(placeholder)
+                    _non_fence_lines.append(placeholder)
+                    _fence_lines = []
+                    _in_fence = False
+            elif _in_fence:
+                _fence_lines.append(line)
+            else:
+                _non_fence_lines.append(line)
+        # Edge case: unclosed fence at end — treat as non-code so we don't lose it
+        if _in_fence:
+            _non_fence_lines.extend(_fence_lines)
+
+        # Now filter only the non-code-block lines
+        lines = _non_fence_lines
+
+        # ═══ Phase 1: protocol / summary section suppression ═══
+        filtered: list[str] = []
         in_protocol = False
-        # Summary section suppressing: once we hit ## Summary, suppress
-        # until next ## heading or end
         suppress_summary = False
 
         for line in lines:
             stripped = line.strip()
 
-            # ── Detect and skip spinner/braille progress lines ──
+            # ── Spinner/braille ──
             if re.match(r"^[⠁-⣿](\s+\S+){0,4}$", stripped) and len(stripped) < 40:
                 continue
             if re.match(r"^Waiting\.\.\.?$", stripped):
@@ -767,11 +890,10 @@ class PtyBridge:
             if re.match(r"^[⠁-⣿]$", stripped):
                 continue
 
-            # ── Detect protocol section entry/exit ──
+            # ── Protocol section ──
             if not in_protocol and re.match(r"^##\s+Protocol", stripped):
                 in_protocol = True
                 continue
-
             if in_protocol:
                 if re.match(r"^##\s", stripped):
                     in_protocol = False
@@ -780,8 +902,6 @@ class PtyBridge:
                 if re.match(r"^──+", line):
                     in_protocol = False
                     continue
-
-                # Skip protocol artifacts
                 if re.match(r"^\s*(###|\+|─|═|📋|🏃|📝)", line):
                     continue
                 if re.search(r"ctrl\+o", stripped) or re.search(r"\(\+\d+\s+lines?\)", stripped):
@@ -794,11 +914,9 @@ class PtyBridge:
                     continue
                 if re.match(r"^\s*(Mode|Status):\s", stripped, re.IGNORECASE):
                     continue
-
-                # Non-artifact text — exit protocol filter
                 in_protocol = False
 
-            # ── Detect and skip summary section ──
+            # ── Summary section ──
             if re.match(r"^##\s+Summary$", stripped):
                 suppress_summary = True
                 continue
@@ -807,136 +925,385 @@ class PtyBridge:
                     suppress_summary = False
                     filtered.append(line)
                     continue
-                if re.match(r"^[─\-═]{3,}", line) or not stripped:
+                if not stripped:
+                    continue
+                if cls._is_horizontal_rule_line(stripped):
                     continue
                 if re.match(r"^[•·●]\s*(Tool|File|Script|Error|User|Exit|Command)", stripped):
                     continue
                 if re.match(r"^\d+\s+\w+\s+for\s", stripped):
                     continue
-                continue  # suppress everything until next heading
+                continue
 
-            # ── Line-level filters ──
+            # ═══ Phase 2: per-line garbage detection ═══
 
-            # Table/markdown table lines — Telegram can't render tables
+            # ── Markdown tables ──
             if re.match(r"^\s*\|.*\|\s*$", stripped):
                 continue
             if re.match(r"^\s*\|[\-\s:]+\|\s*$", stripped):
                 continue
 
-            # Markdown-style separator lines: --- === ─── ═══ (3+ chars)
-            if re.match(r"^[─\-═]{3,}$", stripped):
+            # ── Unicode table-border lines (│ ┃ ┆ etc.) ──
+            if stripped and stripped[0] in "│┃┆┇┈┉┊┋":
                 continue
-            if re.match(r"^={3,}$", stripped):
+
+            # ── Horizontal rules (P0: full coverage) ──
+            if cls._is_horizontal_rule_line(stripped):
                 continue
-            if re.match(r"^[─\-═━]{10,}", line):
+
+            # ── Claude file-reading section headers ────────────────────
+            # When Claude reads code (especially multi-file), it emits
+            # "--- path/to/file.ext ---" separators and VirtualScreen
+            # corruption can produce fragments like "- --- file.ts --" or
+            # "/file.ts ---     --- src/components/...".  Strip these.
+            if cls._is_file_header_line(stripped):
                 continue
+
+            # ── Help/shortcut lines ──
             if re.match(r"^\s*\?\s+for\s+shortcuts", line):
                 continue
             if re.match(r"^\s*Press\s+\w+\s+for\s", line):
                 continue
+
+            # ── Prompt lines ──
             if re.match(r"^[❯>▶]\s+", line):
                 continue
             if re.match(r"^\s*[❯>▶]\s*$", line):
                 continue
-            # Be careful with ● — Claude may use it as a response bullet.
-            # Only suppress it if it's clearly a menu/TUI item.
+
+            # ── ● TUI menu items (not regular bullets) ──
             if re.match(r"^●\s*(Tool|File|Script|Error|User|Exit|Command|Mode|Status)", stripped):
                 continue
-            if re.match(r"^\s*[⎿└├│┌┐┘└├┤┬┴┼╭╮╰╯]\s", line):
+
+            # ── Box-drawing / tree-diagram lines (P1: 25% threshold) ──
+            if stripped and stripped[0] in "⎿└├│┌┐┘└├┤┬┴┼╭╮╰╯╔╗╚╝╠╣╦╩╬┣┫┳┻╋┏┓┗┛":
                 continue
-            # Rows that are mostly box-drawing chars (tree diagrams, etc.)
-            if len(stripped) > 0 and sum(1 for c in stripped if c in '┌┐└┘├┤┬┴┼│─═╭╮╰╯') / max(len(stripped), 1) > 0.3:
-                continue
+            if len(stripped) > 0:
+                bd_ratio = sum(1 for c in stripped if c in cls._BOX_DRAWING_CHARS) / max(len(stripped), 1)
+                if bd_ratio > 0.25:
+                    continue
+
+            # ── Status text ──
             if stripped in ("Waiting…", "Working…", "Thinking…"):
                 continue
             if re.match(r"^(Waiting|Working|Thinking)[…\.]+", stripped):
                 continue
-            # Multi-level indented tree structures (replaced with list)
+
+            # ── Indented tree structures ──
             if re.match(r"^ {12,}(├|└|│|─)", line):
                 continue
 
+            # ── Very-wide blank padding ──
             if re.match(r"^\s{180,}$", line):
                 continue
+
+            # ── TUI hints (P1: expanded coverage) ──
             if any(hint in line for hint in (
-                "Esc to cancel", "Tab to amend", "ctrl+e to explain", "Return to confirm",
+                "Esc to cancel", "Esc to interrupt", "esc to interrupt",
+                "Tab to amend", "ctrl+e to explain", "Return to confirm",
                 'type "continue"', "Ctrl+C to cancel",
+                "shift+tab to cycle", "Shift+Tab to cycle",
+                "press Esc to", "Press Esc to",
+                "press Enter to", "Press Enter to",
+                "press any key", "Press any key",
+                "Esc to", "esc to",
             )):
                 continue
             if re.search(r"ctrl\+o", stripped) or re.search(r"\(\+\d+\s+lines?\)", stripped):
                 continue
-            # Filter out Claude's status lines (think/reason/run duration)
+
+            # ── Claude status lines ──
             if re.search(r"(✻|✶|\*)\s+(Brewed|Cogitated|Churned|Thought|Run|Ran)\s+for", stripped):
                 continue
             if stripped.startswith("✻") and ("for" in stripped) and len(stripped) < 40:
                 continue
+
+            # ── TUI status bars ──
+            if re.match(r"^[⏵⏸]\S*\s+", stripped):
+                continue
+            if "shift+tab to cycle" in stripped:
+                continue
+
+            # ── Protocol artifact lines ──
             if re.match(r"^###\s+\d+\.\s", stripped):
                 continue
             if re.match(r"^Found\s+\d+\s+settings\s+issues", stripped):
                 continue
             if re.match(r"^\s*Exit\s+code:\s+\d+", line):
                 continue
+
+            # ── Decorative emoji / unicode lines ──
             if re.match(r"^[🔃🔄⏳⏺✅❌⚠️]\s", line):
                 continue
             if re.match(r"^\s*\d+\s+files?", stripped):
                 continue
-            # ── Additional decorative unicode filtering ──
-            # Strip lines that are PURELY decorative unicode characters
-            # (box-drawing, geometric shapes, presentation emoji)
-            if re.match(r"^[┏┓┗┛┣┫┳┻╋◆◇▸▹▪▫▴▾◂▸⬤●○◎◉◈⬡⬢⬣▶▷▲▼◀◁]+$", stripped):
+
+            # ── Pure decorative-character lines ──
+            if cls._is_pure_decorative_line(stripped):
                 continue
-            # Lines starting with decorative triangle/bullet sequences (not content)
+            # Lines starting with just a decorative symbol + minimal text
             if re.match(r"^(▸|▹|▪|▫|◆|◇)\s{0,2}$", stripped):
                 continue
-            # ANSI escape code remnants (bare \x1b sequences that survived stripping)
+
+            # ── ANSI remnants ──
             if "\x1b" in stripped or "\033" in stripped or "\e" in stripped:
                 continue
-            # Lines that are just repeated decorative characters (not content)
-            if re.match(r"^[─━═➖➖‐‑‒–—―▔▀]{3,}$", stripped):
-                continue
-            if re.match(r"^[·•●○◉◎](\s*[·•●○◉◎]){3,}$", stripped):
+
+            # ── Emoji/decorator bullet rows (P2: Unicode-range detection) ──
+            if cls._is_decorator_bullet_line(stripped):
                 continue
 
             filtered.append(line)
 
         rendered = "\n".join(filtered)
 
-        # Compress multiple spaces to one (ANSI cursor artifacts)
+        # ═══ Phase 5: post-processing on non-code-block text ═══
+
+        # Space compression (P2: on non-code-block text only)
         rendered = re.sub(r" {2,}", " ", rendered)
 
-        # Strip trailing prompt characters
+        # Trailing prompt cleanup
         rendered = re.sub(r"\s*[❯>▶]\s*$", "", rendered)
 
-        # Clean up common response line prefixes from Claude Code TUI
-        #  "● Hi there" → "Hi there"
+        # ● prefix removal (Claude TUI artifact)
         rendered = re.sub(r"^●\s+", "", rendered, flags=re.MULTILINE)
 
-        # Remove leading/trailing blank lines
+        # Trim
         rendered = rendered.strip()
 
-        # Collapse 3+ consecutive blank lines to 2
+        # Collapse 3+ consecutive blank lines → 2
         rendered = re.sub(r"\n{4,}", "\n\n\n", rendered)
 
-        # SAFETY: never return completely empty if we filtered too aggressively.
-        # Fall back to a minimal cleanup of the raw rendered text.
+        # ═══ Reinsert code blocks ═══
+        for i, placeholder in enumerate(placeholders):
+            if placeholder in rendered:
+                rendered = rendered.replace(placeholder, code_blocks[i])
+            else:
+                # Placeholder may have been absorbed by blank-line collapse
+                # or other transforms. Re-append at the end.
+                rendered = rendered.rstrip() + "\n\n" + code_blocks[i]
+
+        # ── Safety fallback ──
         if not rendered:
-            # Minimal cleanup: just strip prompt chars and obvious artifacts
-            minimal = []
+            minimal: list[str] = []
             for line in _all_lines:
                 s = line.strip()
                 if not s:
                     continue
-                if re.match(r"^[─\-═━]{10,}", s):
+                if cls._is_horizontal_rule_line(s):
+                    continue
+                if cls._is_file_header_line(s):
                     continue
                 if re.match(r"^\s*[❯>▶]\s*$", s):
                     continue
                 if re.match(r"^\s*\?\s+for\s+shortcuts", s):
                     continue
                 minimal.append(line)
-            rendered = "\n".join(minimal)
-            rendered = re.sub(r" {2,}", " ", rendered)
+            rendered_lines = "\n".join(minimal)
+            rendered = re.sub(r" {2,}", " ", rendered_lines)
             rendered = rendered.strip()
 
         return rendered
+
+    # ⸻ Helper: horizontal-rule detection ──────────────────────────────
+
+    @classmethod
+    def _is_horizontal_rule_line(cls, stripped: str) -> bool:
+        """Check if a line is a horizontal rule / separator.
+
+        Covers:
+          ---, ___ (3+ consecutive same hr-char, no other content)
+          ───, ═══, ━━━ (Unicode box-drawing dashes)
+          - - - - -, _ _ _ _ _ (spaced-out dashes)
+          ···, •••, ○○○  (3+ consecutive same bullet, no other content)
+
+        Does NOT match:
+          - name: value   (YAML — mixed content)
+          --flag          (CLI flag — has alphabetic suffix)
+          ——              (Chinese em-dash, exactly 2 chars)
+        """
+        if not stripped:
+            return False
+
+        # Bullet-only rows: ···  •••  ○○○  (3+ identical bullets, nothing else)
+        # Check BEFORE hr_count since bullets aren't in _HR_CHARS.
+        if re.match(r"^([·•●○◉◎])\1{2,}$", stripped):
+            return True
+
+        # Quick positive check: must be mostly hr-characters
+        hr_count = sum(1 for c in stripped if c in cls._HR_CHARS)
+        if hr_count < 3:
+            return False
+
+        # Pure hr-character line: ---  ═══  ───  ___  (3+ of the same char)
+        if re.match(r"^([_\-=])\1{2,}$", stripped):
+            return True
+        if re.match(r"^[─━═➖‐‑‒–—―▔▀]{3,}$", stripped):
+            return True
+
+        # Spaced hr:  - - - - -   _ _ _ _ _   · · · ·
+        if re.match(r"^([_\-─━═]\s+){2,}[_\-─━═]\s*$", stripped):
+            return True
+
+        # Spaced multi-char dashes: ---     ---     ---
+        if re.match(r"^(\-{2,}\s+){2,}\-{2,}\s*$", stripped):
+            return True
+
+        # Catch-all: lines predominantly composed of hr-chars (>50% ratio)
+        # with little real content (< 15 non-hr, non-whitespace characters).
+        # This catches VirtualScreen corruption artifacts where fragments of
+        # file-path headers merge with dashes to produce mangled lines that
+        # are mostly separators but don't match any clean pattern.
+        non_hr_non_ws = [c for c in stripped if c not in cls._HR_CHARS and c != " "]
+        if len(non_hr_non_ws) < 15 and hr_count >= len(stripped) * 0.5:
+            return True
+
+        return False
+
+    # ⸻ Helper: file-header-line detection ─────────────────────────────
+
+    # File extensions commonly found in Claude Code file-reading output
+    _COMMON_EXTENSIONS = (
+        "ts", "tsx", "js", "jsx", "json", "md", "mdx", "py", "rb", "go",
+        "rs", "java", "kt", "swift", "c", "cpp", "h", "hpp", "css", "scss",
+        "less", "html", "htm", "xml", "svg", "yml", "yaml", "toml", "ini",
+        "cfg", "conf", "env", "sh", "bash", "zsh", "fish", "ps1", "bat",
+        "sql", "graphql", "gql", "proto", "vue", "svelte", "astro",
+        "dockerfile", "makefile", "gitignore", "editorconfig",
+    )
+
+    @classmethod
+    def _is_file_header_line(cls, stripped: str) -> bool:
+        """Detect Claude Code file-reading section headers.
+
+        Claude Code emits these patterns when reading source code:
+          --- path/to/file.ts ---
+          --- src/components/Button.tsx (lines 1-50) ---
+
+        VirtualScreen corruption (100-row PTY with 200-cols) produces
+        truncated / merged variants:
+          - --- file.ts --
+          --- --- src/components/Button34.tsx
+          .tsx ---     --- src/components/Button41
+          /components/Button29.tsx ---     --- src
+          ton48.tsx ---     --- src/components/But
+          - src/components/Button36.tsx --- --
+        """
+        if not stripped or len(stripped) < 5:
+            return False
+
+        ext_pattern = "|".join(cls._COMMON_EXTENSIONS)
+        _has_ext = re.search(rf"\.(?:{ext_pattern})\b", stripped, re.IGNORECASE)
+
+        # Pattern A: "--- path.ext ---"  (clean Claude output)
+        if re.match(r"^---+\s+\S+\.\S+\s+---+$", stripped):
+            return True
+
+        # Pattern B: "--- path.ext (lines N-M) ---"
+        if re.match(r"^---+\s+\S+\.\S+\s+\(lines\s+\d+[-–]\d+\)\s+---+$", stripped):
+            return True
+
+        # Pattern D (new): line starts with --- and the non-dash content
+        # is ONLY path-like fragments (no actual code). This catches
+        # severe VirtualScreen corruption where the file extension
+        # itself gets mangled (e.g. "--- src/compone  ---").
+        if re.match(r"^---+\s", stripped):
+            _no_dash_stripped = re.sub(r"[-─═]", "", stripped).strip()
+            # Must contain some path-like content (slashes, dots)
+            if _no_dash_stripped and ("/" in _no_dash_stripped or "." in _no_dash_stripped):
+                # Must NOT contain code keywords
+                if not re.search(
+                    r'\b(import|export|const|let|var|function|class|return|if|for|while|async|await|yield|throw|try|catch)\b',
+                    _no_dash_stripped,
+                ):
+                    # No long alphanumeric runs (> 30 chars) — these indicate code
+                    if not re.search(r'[A-Za-z_][A-Za-z0-9_]{29,}', _no_dash_stripped):
+                        # Content after --- is short or path-like
+                        content_part = re.sub(r"^---+\s*", "", stripped)
+                        if len(content_part) < 80:
+                            return True
+
+        # Pattern C: VirtualScreen corruption variants.
+        # These always involve file extensions AND --- somewhere.
+        if "---" not in stripped:
+            return False
+        if not _has_ext:
+            return False
+
+        # VirtualScreen corruption lines are short and have no
+        # meaningful code content --- just file-path bits and dashes.
+        # Heuristic: remove dashes, and check if what remains looks
+        # like file-path fragments (no code keywords, no long words).
+        _no_dash = re.sub(r"[-─═]", "", stripped).strip()
+        # Must still have a file extension after dash removal
+        if not re.search(rf"\.(?:{ext_pattern})\b", _no_dash, re.IGNORECASE):
+            return False
+        # No code keywords: import, export, const, function, class, etc
+        if re.search(r'\b(import|export|const|let|var|function|class|return|if|for|while)\b', _no_dash):
+            return False
+        # No long alphanumeric runs (> 20 chars) — these indicate code identifiers
+        if re.search(r'[A-Za-z_][A-Za-z0-9_]{19,}', _no_dash):
+            return False
+        # Ratio: dashes should be a significant portion (>= 15% of the line)
+        if len(stripped) < 120 and len(_no_dash) <= len(stripped) * 0.85:
+            return True
+
+        return False
+
+    # ⸻ Helper: pure-decorative-line detection ─────────────────────────
+
+    @classmethod
+    def _is_pure_decorative_line(cls, stripped: str) -> bool:
+        """Check if the entire line is nothing but decorative/ornament chars."""
+        if not stripped:
+            return False
+        for c in stripped:
+            if c not in cls._DECORATIVE_CHARS and c not in cls._BOX_DRAWING_CHARS and c != " ":
+                return False
+        return True
+
+    # ⸻ Helper: decorator-bullet-line detection (P2) ───────────────────
+
+    # Unicode ranges commonly used for TUI decorations / bullets
+    _DECORATOR_RANGES = (
+        (0x2300, 0x23FF),   # Miscellaneous Technical (⏎ ⏵ ⏸ …)
+        (0x2500, 0x257F),   # Box Drawing
+        (0x2580, 0x259F),   # Block Elements
+        (0x25A0, 0x25FF),   # Geometric Shapes (● ◆ ▶ …)
+        (0x2600, 0x26FF),   # Misc Symbols
+        (0x2700, 0x27BF),   # Dingbats (✻ ✶ …)
+        (0x1F300, 0x1F5FF), # Misc Symbols & Pictographs
+        (0x1F600, 0x1F64F), # Emoticons
+        (0x1F680, 0x1F6FF), # Transport & Map
+        (0x1F900, 0x1F9FF), # Supplemental Symbols
+    )
+
+    @classmethod
+    def _is_decorator_bullet_line(cls, stripped: str) -> bool:
+        """Check if line starts with a TUI-decorator/emoji and has little real text.
+
+        Heuristic: line starts with a char in a known decorative Unicode range,
+        followed by very little real content — likely a TUI menu/status item
+        rather than real message content.
+
+        ● is excluded from this check because Claude uses ● as a regular
+        response bullet in rich output mode (not just TUI menus).
+        """
+        if not stripped or len(stripped) < 2:
+            return False
+        first_char = stripped[0]
+        # ● (U+25CF) is legitimately used by Claude as a response bullet.
+        # Don't filter lines starting with ● via this heuristic.
+        if first_char == "●":
+            return False
+        cp = ord(first_char)
+        in_decorator_range = any(lo <= cp <= hi for lo, hi in cls._DECORATOR_RANGES)
+        if not in_decorator_range:
+            return False
+        # Only flag it if it's very short (< 40 chars) with <= 2 words
+        if len(stripped) < 40 and len(stripped.split()) <= 2:
+            return True
+        return False
 
     # ── Helpers ─────────────────────────────────────────────────────────
 
@@ -1018,19 +1385,14 @@ class PtyBridge:
     @staticmethod
     def _check_prompt_in_text(text: str) -> bool:
         """
-        Check whether the last significant line of text contains a prompt character.
+        Check whether text contains a prompt character near the end.
 
-        Uses the same prompt characters defined in PROMPT_CHARS.
-        An empty or whitespace-only buffer means prompt not detected.
+        Delegates to output_parser.is_prompt_detected which handles
+        --bare TUI mode correctly (skipping status/decorator lines
+        like ⏵⏵automodeon that may appear after the prompt).
         """
-        stripped = text.rstrip()
-        if not stripped:
-            return False
-        # Check last line for prompt character at end or as the only content
-        last_line = stripped.split("\n")[-1].strip()
-        if not last_line:
-            return False
-        return last_line[-1] in PROMPT_CHARS or last_line in PROMPT_CHARS
+        from output_parser import is_prompt_detected
+        return is_prompt_detected(text)
 
     def _check_prompt_detected(self) -> bool:
         """

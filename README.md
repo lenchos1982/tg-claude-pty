@@ -903,17 +903,42 @@ tg-claude-pty/
 │                           # - chmod 600 recommended
 │                           # - Contains TELEGRAM_BOT_TOKEN and secrets
 │
-├── CLAUDE.md               # Claude Code instruction file
-│                           # - Project-level safety rules
-│                           # - Behavioral constraints for Claude
-│                           # - Read by Claude CLI on startup
-│                           # - Critical for security (see §7)
+├── .claude/
+│   └── settings.local.json # Claude Code permissions config
+│                           # - Permissions allow list (90+ rules)
+│                           # - Bash, file, git, npm, Python, system
+│                           # - pre-authorized commands
+│                           # - chmod 600 recommended
 │
 ├── tg-claude-pty.service   # systemd service unit
 │                           # - Production deployment config
-│                           # - Runs as dedicated user (claude)
-│                           # - Loads env vars from .env file
+│                           # - WorkingDirectory=/root/tg-claude-pty
+│                           # - Loads env vars from /root/tg-claude-pty/.env
+│                           # - Loads API key from EnvironmentFile
 │                           # - Includes systemd hardening options
+│
+├──
+└── README.md               # This file
+
+### 分離的楚熙目錄
+
+注意：**CLAUDE.md 不在 PTY 項目中**，而是位於獨立的 `/root/chuxi/` 目錄：
+
+```
+/root/chuxi/
+├── CLAUDE.md                 # 楚熙的身份規則（透過 --system-prompt-file 載入）
+└── .claude/
+    └── settings.local.json   # → symlink to /root/tg-claude-pty/.claude/settings.local.json
+```
+
+這樣的目的是**避免楚熙被 PTY 項目的開發文檔誤導**。CLAUDE.md 只包含楚熙的身份認知和行為規則，不含項目的技術架構說明。
+
+楚熙的啟動命令：
+```bash
+claude --bare --permission-mode auto \
+  --settings /root/tg-claude-pty/.claude/settings.local.json \
+  --system-prompt-file /root/chuxi/CLAUDE.md
+```
 │
 ├── .gitignore              # Git exclusion rules
 │                           # - Excludes .env, __pycache__, *.pyc
