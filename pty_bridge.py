@@ -15,7 +15,7 @@ Architecture:
 Key design decisions:
   - Reader thread continuously reads PTY output and responds to DA queries
   - Startup sequence sends Enter to dismiss theme/security/trust dialogs
-  - Completion detection: prompt pattern + silence timeout
+  - Completion detection: prompt character (❯/▶/>) only — no silence timeout
   - Single-user, asyncio.Lock serializes requests
   - Echo is NOT actively skipped in send(); _clean_output filters echo lines
     via the ^[❯>▶]\s+ pattern. This avoids fragile byte-level echo detection
@@ -41,12 +41,10 @@ logger = logging.getLogger("tg-claude-pty")
 
 # ── Constants ───────────────────────────────────────────────────────────────
 
-SILENCE_TIMEOUT = 10.0  # seconds of no output before declaring done (raised from 4.0)
-MIN_RESPONSE_WAIT = 8.0  # minimum seconds to wait before checking completion (raised from 5.0)
-COMMAND_SILENCE_MULTIPLIER = 3.0  # extra silence tolerance for command execution (raised from 2.0)
-MAX_SILENCE_TIMEOUT = 30.0  # hard cap for silence timeout even with extreme burst counts
+STARTUP_SILENCE_TIMEOUT = 10.0  # silence during startup → ready (with >1000 bytes)
 START_TIMEOUT = 60.0  # max seconds for full startup (including dialogs)
 DEFAULT_RESPONSE_TIMEOUT = 0  # unlimited — wait indefinitely for Claude to finish
+ABSOLUTE_MAX_WAIT = 1800.0  # 30 min — hard safety cap, returns whatever is available
 DIALOG_ENTER_INTERVAL = 1.5  # seconds between Enter presses during startup
 PTY_ROWS = 100
 PTY_COLS = 200
@@ -88,13 +86,9 @@ class PtyBridge:
         # When Claude runs a bash command, the subprocess may produce
         # continuous output bursts. If these bursts suddenly stop, it
         # could mean the subprocess is hung (not Claude finished).
-        # We track consecutive reads within 500ms as a "burst" and
-        # use this to extend silence timeout during command execution.
-        #
-        # Dynamically scales: each burst above 3 adds COMMAND_SILENCE_MULTIPLIER
-        # to the effective silence timeout, up to MAX_SILENCE_TIMEOUT.
-        # This allows long-running commands (cp, systemctl, npm install) to
-        # complete without being cut off by the silence detector.
+        # We track consecutive reads within 500ms as a "burst" — used
+        # for observability logging only. Silence timeout is NOT used
+        # for completion; prompt detection is the sole trigger.
         self._output_burst_count = 0
         self._last_output_burst = 0.0
 
@@ -289,7 +283,7 @@ class PtyBridge:
             elif current_len > 1000 and silent_start is None:
                 silent_start = now
             elif current_len > 1000 and silent_start is not None:
-                if now - silent_start >= SILENCE_TIMEOUT:
+                if now - silent_start >= STARTUP_SILENCE_TIMEOUT:
                     self._ready = True
                     break
 
@@ -614,39 +608,41 @@ class PtyBridge:
                     self._output_burst_count = 1
                 self._last_output_burst = now
 
-            # Response completion: one of two conditions
-            #    Condition A: silence + minimum wait time elapsed
-            #    Condition B: prompt character detected in latest buffer chunk
-            #      (only if the prompt is NEW — appeared after send() started)
+            # ── Response completion detection ────────────────────────
+            # Only ONE condition triggers completion:
+            #    Prompt character (❯/▶/>) detected in NEW output
+            #    (i.e. output that appeared AFTER send() started).
+            #
+            # Silence timeout is DELIBERATELY not used. It was a
+            # source of premature cutoffs for long-running commands.
+            # The reader thread waits indefinitely for Claude to
+            # finish; an absolute max-wait safety net (1800s) is in
+            # _wait_for_response() instead.
+            #
+            # Output burst tracking is logged for observability but
+            # does not affect completion logic.
             if self._expecting_response and self._last_data_time > 0:
                 elapsed = now - self._send_start_time
-                silence = now - self._last_data_time
 
-                # Condition A: silence-based completion
-                # Dynamically scale silence timeout based on output burst count.
-                # Each burst beyond 3 indicates more complex subprocess execution.
-                # Scale: base + (burst_count - 3) * multiplier, capped at MAX.
+                # Log burst activity for observability (debug only)
                 if self._output_burst_count >= 3:
-                    scale = 1.0 + (min(self._output_burst_count, 10) - 2) * (COMMAND_SILENCE_MULTIPLIER - 1.0) / 7.0
-                    effective_silence = min(SILENCE_TIMEOUT * scale, MAX_SILENCE_TIMEOUT)
-                    effective_min_wait = min(MIN_RESPONSE_WAIT * (1.0 + scale * 0.3), MAX_SILENCE_TIMEOUT * 0.8)
-                else:
-                    effective_silence = SILENCE_TIMEOUT
-                    effective_min_wait = MIN_RESPONSE_WAIT
+                    silence = now - self._last_data_time
+                    if silence > 10.0 and self._output_burst_count % 5 == 0:
+                        logger.debug(
+                            "Burst=%d active, elapsed=%.0fs, silence=%.0fs — "
+                            "waiting for prompt (not using silence timeout)",
+                            self._output_burst_count, elapsed, silence,
+                        )
 
-                silence_trigger = elapsed >= effective_min_wait and silence >= effective_silence
-
-                # Condition B: prompt-based completion
-                #    Check the last line of current buffer for prompt character
-                #    Only accept prompt if it was detected AFTER send() started
-                #    (avoids stale-prompt race from previous response)
+                # Prompt-based completion: only trigger if prompt
+                # appeared in content written AFTER send() started.
                 prompt_trigger = False
                 if elapsed >= 0.5:
                     prompt_detected, prompt_pos = self._check_prompt_detected_with_pos()
                     if prompt_detected and prompt_pos > self._send_prompt_watermark:
                         prompt_trigger = True
 
-                if silence_trigger or prompt_trigger:
+                if prompt_trigger:
                     self._response_event.set()
 
             # ── Prompt-ready detection (for input-stacking prevention) ──
@@ -666,21 +662,30 @@ class PtyBridge:
     def _wait_for_response(self, timeout: float):
         """Block until response completion or timeout. Returns False if timed out.
 
+        Completion is triggered by the reader thread detecting Claude's prompt
+        (prompt_trigger). Silence timeout is deliberately NOT used here — see
+        _reader_loop for rationale. The ABSOLUTE_MAX_WAIT safety net ensures we
+        never block forever even if prompt detection fails.
+
         NOTE: The _response_event is cleared in send() BEFORE the PTY write.
-        The reader thread will set it again when sufficient response has been
-        collected (prompt detected OR silence timeout). This avoids the race
-        where the reader sets the event before _wait_for_response clears it.
+        The reader thread will set it again when the prompt is detected.
+        This avoids the race where the reader sets the event before
+        _wait_for_response clears it.
         """
         start_wait = time.monotonic()
+        # Safety cap: if caller passes 0 (unlimited), use ABSOLUTE_MAX_WAIT.
+        # If caller passes a specific timeout, use it but never exceed MAX_WAIT.
+        effective_timeout = ABSOLUTE_MAX_WAIT if timeout <= 0 else min(timeout, ABSOLUTE_MAX_WAIT)
+
         while self._response_event.wait(timeout=1.0) is False:
             # Check if the bridge is still running
             if not self._running:
                 return False
-            # Check overall timeout
-            if time.monotonic() - start_wait >= timeout:
+            # Check absolute max-wait safety net
+            if time.monotonic() - start_wait >= effective_timeout:
                 logger.warning(
-                    "Response timeout after %.1fs (silence-based detection may have failed)",
-                    timeout,
+                    "Absolute max-wait reached (%.0fs) — returning partial response",
+                    effective_timeout,
                 )
                 return False
         return True
