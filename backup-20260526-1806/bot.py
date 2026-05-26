@@ -23,13 +23,16 @@ from telegram import Update
 from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, MessageHandler, filters
 
-from config import TELEGRAM_BOT_TOKEN, CLAUDE_BIN, ALLOWED_USER_IDS, SESSION_ID
+from config import (
+    TELEGRAM_BOT_TOKEN, CLAUDE_BIN, ALLOWED_USER_IDS, SESSION_ID,
+    PROGRESS_INTERVAL, TASK_DEFAULT_TIMEOUT,
+)
 from pty_bridge import PtyBridge
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
 MAX_REPLY_LENGTH = 4000
-SEND_TIMEOUT = 1800.0  # 30 minutes max for a single response
+SEND_TIMEOUT = TASK_DEFAULT_TIMEOUT  # max seconds for a single response
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 
@@ -252,18 +255,14 @@ async def new_command(update: Update, _context):
         return
 
     global bridge
-
-    if bridge is None:
-        await update.message.reply_text("❌ Bridge is not initialized. Try again in a moment.")
-        return
-
     msg = await update.message.reply_text("🔄 Resetting Claude session...")
 
     # Lock the processor from picking up new requests while we reset
     await _pause_processor()
     try:
-        await bridge.stop()
-        bridge.reset()
+        if bridge is not None:
+            await bridge.stop()
+            bridge.reset()
         try:
             loop = asyncio.get_running_loop()
             await loop.run_in_executor(None, lambda: bridge.start(loop))
@@ -276,35 +275,19 @@ async def new_command(update: Update, _context):
 
 
 async def stop_command(update: Update, _context):
-    """Handle /stop command — cancel current task and restart Claude."""
+    """Handle /stop command — restart Claude if stuck."""
     if not _is_authorized(update):
         await update.message.reply_text("❌ You are not authorized to use this bot.")
         return
 
-    global bridge, _current_task
-
-    if bridge is None:
-        await update.message.reply_text("❌ Bridge is not initialized. Try again in a moment.")
-        return
-
-    # Cancel any running background task first
-    if _current_task is not None and not _current_task.done():
-        logger.info("/stop: cancelling background task")
-        _current_task.cancel()
-        try:
-            await _current_task
-        except asyncio.CancelledError:
-            logger.info("/stop: background task cancelled")
-        except Exception:
-            pass
-        _current_task = None
-
+    global bridge
     msg = await update.message.reply_text("⏳ Restarting Claude...")
 
     await _pause_processor()
     try:
-        await bridge.stop()
-        bridge.reset()
+        if bridge is not None:
+            await bridge.stop()
+            bridge.reset()
         try:
             loop = asyncio.get_running_loop()
             await loop.run_in_executor(None, lambda: bridge.start(loop))
@@ -316,12 +299,35 @@ async def stop_command(update: Update, _context):
         _resume_processor()
 
 
+async def cancel_command(update: Update, _context):
+    """Handle /cancel command — cancel the currently running task."""
+    if not _is_authorized(update):
+        await update.message.reply_text("❌ You are not authorized to use this bot.")
+        return
+
+    global bridge
+
+    if bridge is None or not bridge.task_active:
+        await update.message.reply_text("ℹ️ No task is currently running.")
+        return
+
+    msg = await update.message.reply_text("🛑 Cancelling task...")
+
+    try:
+        await asyncio.get_running_loop().run_in_executor(
+            None, bridge.cancel_current_task
+        )
+        await msg.edit_text("🚫 Task cancelled.")
+    except Exception as e:
+        logger.error("Cancel failed: %s", e)
+        await msg.edit_text("❌ Failed to cancel task. Try /stop to restart.")
+
+
 # ── Request Processor ────────────────────────────────────────────────────────
 # Single-user: asyncio.Lock serializes requests. If lock is held, the user
 # gets an immediate "please wait" message. No queue, no drops.
 
 _processor_paused = False  # Flag to temporarily pause processing (for /new, /stop)
-_current_task: Optional[asyncio.Task] = None  # Track the background task for /stop
 
 
 def _resume_processor():
@@ -339,83 +345,138 @@ async def _pause_processor():
     logger.info("Request processor paused")
 
 
-async def _process_request_in_lock(
-    prompt: str,
-    image_path: Optional[str] = None,
-) -> tuple[Optional[str], Optional[str]]:
+async def _monitor_task_completion(incoming_msg: object, task_prompt: str):
     """
-    Process a single request inside the lock.
-    Returns (result_text, error_message).
+    Background coroutine that monitors task completion and sends results.
+
+    Runs concurrently with bot polling. Checks bridge._task_completed
+    periodically and sends the result back to the user when done.
     """
-    global bridge, _processor_paused
+    global bridge
 
-    # Secondary safety net: reject if bridge restart is in progress.
-    # The primary check is in handle_message (before lock), but if the
-    # lock was already acquired and a restart started between then and
-    # now, catch it here too.
-    if _processor_paused:
-        logger.warning("Bridge restart in progress (detected inside lock)")
-        return None, "The bridge is restarting. Please wait a moment and try again."
+    task_msg = incoming_msg
+    start_time = asyncio.get_running_loop().time()
+    last_progress_update = 0.0
 
-    logger.info("Processing request (text_len=%d)", len(prompt))
+    while True:
+        if bridge is None or not bridge._running:
+            logger.error("Bridge died during task execution - attempting auto-restart")
+            try:
+                await task_msg.edit_text("🔄 Bridge connection lost, reconnecting...")
+            except Exception:
+                pass
+            try:
+                ok = await _restart_bridge()
+                if ok and bridge is not None and bridge.is_ready:
+                    logger.info("Bridge auto-restarted after task failure")
+                    try:
+                        await task_msg.edit_text(
+                            "🔁 Bridge reconnected, but the previous task was lost.\n"
+                            "Please re-send your request."
+                        )
+                    except Exception:
+                        pass
+                else:
+                    logger.error("Bridge auto-restart after task failure FAILED")
+                    try:
+                        await task_msg.edit_text("❌ Bridge reconnection failed. Please use /stop to restart manually.")
+                    except Exception:
+                        pass
+            except Exception as e:
+                logger.error("Bridge auto-restart raised exception: %s", e)
+                try:
+                    await task_msg.edit_text("❌ Bridge reconnection failed: %s. Try /stop manually." % str(e)[:100])
+                except Exception:
+                    pass
+            return
 
-    # Ensure bridge is running
-    ok = await _ensure_bridge_running()
-    if not ok:
-        return None, "Bridge not available"
+        # Task completed
+        if bridge._task_completed.is_set():
+            elapsed = asyncio.get_running_loop().time() - start_time
+            logger.info("Task completed after %.1fs", elapsed)
 
-    # Send to Claude
-    reply_text = None
-    send_error = None
-    try:
-        reply_text = await bridge.send(prompt, timeout=SEND_TIMEOUT)
-    except Exception as e:
-        error_type = type(e).__name__
-        logger.error("Error during bridge.send: [%s] %s\n%s", error_type, e, traceback.format_exc())
-        send_error = error_type
-        reply_text = None
+            try:
+                result = bridge._task_result
+                if not result:
+                    result = bridge._extract_task_summary()
 
-    if reply_text is not None and len(reply_text) > 0:
-        reply_text = _truncate_reply(reply_text)
-        logger.info("Reply text (%d chars): %s", len(reply_text), reply_text[:1000])
-        formatted_text = _format_markdown_v2(reply_text)
-        return formatted_text, None
+                if result and len(result.strip()) > 0:
+                    formatted = _truncate_reply(result)
+                    formatted = _format_markdown_v2(formatted)
+                    try:
+                        await task_msg.edit_text(formatted, parse_mode=ParseMode.MARKDOWN_V2)
+                    except Exception as e:
+                        logger.warning("MarkdownV2 parse failed, falling back: %s", e)
+                        from output_parser import strip_ansi
+                        fallback = strip_ansi(result)
+                        fallback = fallback.replace(r"\_", "_").replace(r"\*", "*")
+                        fallback = _truncate_reply(fallback)
+                        try:
+                            await task_msg.edit_text(fallback)
+                        except Exception as e2:
+                            logger.error("Plain text fallback also failed: %s", e2)
+                            await task_msg.edit_text("✅ Task completed (result formatting failed).")
+                else:
+                    await task_msg.edit_text("✅ Task completed (empty result).")
+            except Exception as e:
+                logger.error("Error formatting task result: %s", e)
+                await task_msg.edit_text("✅ Task completed (error formatting result).")
 
-    elif reply_text is not None and len(reply_text) == 0:
-        # Empty reply: try to extract something useful from the buffer
-        logger.warning("Reply text is empty — checking buffer for fallback content")
-        try:
-            buffer_tail = bridge._get_readable_buffer_tail(max_chars=2000)
-            if buffer_tail and len(buffer_tail) > 10:
-                logger.info("Buffer fallback (%d chars): %s", len(buffer_tail), buffer_tail[:500])
-                fallback_text = _truncate_reply(buffer_tail)
-                formatted_text = _format_markdown_v2(fallback_text)
-                return formatted_text + "\n\n_(⚠️ Task likely interrupted — content may be incomplete)_", None
-            else:
-                return None, "Claude 返回了空內容，請使用 /new 重置後再試"
-        except Exception as buf_err:
-            logger.error("Failed to get buffer fallback: %s", buf_err)
-            return None, "Claude 返回了空內容（buffer 不可用）"
+            try:
+                bridge.set_task_mode(False)
+            except Exception:
+                pass
+            return
 
-    else:
-        if send_error:
-            return None, f"系統錯誤：[{send_error}]，請重試或使用 /new 重置"
-        else:
-            return None, "Claude 沒有返回任何內容，可能是任務尚未完成"
+        # Task cancelled
+        if bridge._task_cancelled.is_set():
+            logger.info("Task was cancelled by user")
+            try:
+                await task_msg.edit_text("🚫 Task cancelled.")
+            except Exception:
+                pass
+            try:
+                bridge.set_task_mode(False)
+            except Exception:
+                pass
+            return
+
+        # Timeout check
+        elapsed = asyncio.get_running_loop().time() - start_time
+        if elapsed >= TASK_DEFAULT_TIMEOUT:
+            logger.warning("Task timed out after %.0fs", elapsed)
+            try:
+                await task_msg.edit_text(
+                    f"⏰ Task timed out after {TASK_DEFAULT_TIMEOUT:.0f}s.\n"
+                    f"Try breaking the request into smaller parts or use /new."
+                )
+            except Exception:
+                pass
+            try:
+                await asyncio.get_running_loop().run_in_executor(
+                    None, bridge.cancel_current_task
+                )
+            except Exception:
+                pass
+            return
+
+        # Progress update every PROGRESS_INTERVAL seconds
+        if elapsed - last_progress_update >= PROGRESS_INTERVAL:
+            last_progress_update = elapsed
+            minutes = int(elapsed // 60)
+            seconds = int(elapsed % 60)
+            progress_text = f"⏳ Task running... ({minutes}m{seconds:02d}s elapsed)"
+            try:
+                await task_msg.edit_text(progress_text)
+            except Exception:
+                pass
+
+        await asyncio.sleep(1.0)
 
 
 async def handle_message(update: Update, _context):
-    """Handle incoming text/image messages — dispatch task and return immediately."""
+    """Handle incoming messages - submit as task to Claude."""
     if not _is_authorized(update):
-        return  # Silently ignore unauthorized users
-
-    # Don't accept new messages while the bridge is being restarted
-    global _processor_paused
-    if _processor_paused:
-        logger.info("Bridge restart in progress — rejecting message")
-        await update.message.reply_text(
-            "🔄 Bridge is restarting, please wait a moment and try again."
-        )
         return
 
     user_text = update.message.text.strip() if update.message.text else ""
@@ -427,7 +488,14 @@ async def handle_message(update: Update, _context):
         user_text[:200] if user_text else "(image)",
     )
 
-    # Handle images: download to temp file
+    # Check if task already running
+    if bridge is not None and bridge.task_active:
+        await update.message.reply_text(
+            "⏳ A task is already running. Please wait for it to complete or use /cancel."
+        )
+        return
+
+    # Handle images
     image_path: Optional[str] = None
     if photo:
         file = await update.message.effective_attachment.get_file()
@@ -440,12 +508,13 @@ async def handle_message(update: Update, _context):
             user_text = "Please describe this image."
 
     if not user_text:
-        return  # Not a text/image message
+        return
 
     # Build prompt with optional image
     prompt = user_text
     if image_path:
         import base64
+
         try:
             with open(image_path, "rb") as f:
                 b64_data = base64.b64encode(f.read()).decode("ascii")
@@ -458,97 +527,30 @@ async def handle_message(update: Update, _context):
             logger.error("Failed to read image %s: %s", image_path, e)
             prompt = f"[Image attached]\nUser message: {user_text}"
 
-    # If lock is held, tell user to wait
-    if _request_lock.locked():
-        logger.info("Lock held — queueing")
-        await update.message.reply_text("⏳ 前一個請求仍在處理中，請稍後再試")
+    # Clean up temp file
+    if image_path:
+        try:
+            os.unlink(image_path)
+        except OSError:
+            pass
+
+    # Ensure bridge is running
+    ok = await _ensure_bridge_running()
+    if not ok:
+        await update.message.reply_text(
+            "😔 橋接器未就緒，正在自動重連請稍後再試\n\n"
+            "• Try /stop to restart Claude"
+        )
         return
 
-    # Confirm immediately, then process in background
-    confirm = await update.message.reply_text("✅ 任務已接收，將在背景執行")
+    # Acquire lock and dispatch task
+    async with _request_lock:
+        # Send immediate confirmation
+        confirm_msg = await update.message.reply_text("✅ 任務已接收，將在背景執行")
 
-    async def _run_task(chat_id: int, reply_to_msg_id: int, prompt: str, image_path: Optional[str]):
-        """Run the request in background and send result as new message."""
-        global _current_task
-        try:
-            async with _request_lock:
-                try:
-                    result_text, error_msg = await _process_request_in_lock(
-                        prompt=prompt,
-                        image_path=image_path,
-                    )
-                except asyncio.CancelledError:
-                    raise
-                except Exception as e:
-                    logger.error("Background task error: %s\n%s", e, traceback.format_exc())
-                    result_text = None
-                    error_msg = f"系統錯誤：[{type(e).__name__}]"
-                finally:
-                    if image_path:
-                        try:
-                            os.unlink(image_path)
-                        except OSError:
-                            pass
-
-            # Send result as a new reply message
-            if result_text is not None:
-                try:
-                    await _context.bot.send_message(
-                        chat_id=chat_id,
-                        text=result_text,
-                        parse_mode=ParseMode.MARKDOWN_V2,
-                        reply_to_message_id=reply_to_msg_id,
-                    )
-                except Exception as e:
-                    logger.warning("MarkdownV2 failed in background task, fallback: %s", e)
-                    from output_parser import strip_ansi
-                    fallback = strip_ansi(result_text)
-                    fallback = fallback.replace(r"\_", "_").replace(r"\*", "*")
-                    try:
-                        await _context.bot.send_message(
-                            chat_id=chat_id,
-                            text=fallback,
-                            reply_to_message_id=reply_to_msg_id,
-                        )
-                    except Exception as e2:
-                        logger.error("Plain text fallback also failed: %s", e2)
-            else:
-                if error_msg is None:
-                    reply = "😔 Sorry, Claude didn't respond."
-                elif "Bridge not available" in str(error_msg):
-                    reply = (
-                        "😔 與 Claude 的連接異常，正在自動重連，請稍後重試\n\n"
-                        "• Try /stop to restart Claude"
-                    )
-                elif "timeout" in str(error_msg).lower() or "timed out" in str(error_msg).lower():
-                    reply = (
-                        "⏰ Claude took too long to respond.\n\n"
-                        "• Try /stop to restart Claude"
-                    )
-                elif "empty response" in str(error_msg).lower() or "空內容" in str(error_msg):
-                    reply = "📭 Claude returned an empty response。請使用 /new 重置後再試"
-                elif "系統錯誤" in str(error_msg) or "Claude 沒有返回" in str(error_msg):
-                    reply = str(error_msg)
-                else:
-                    reply = f"😔 Sorry, Claude didn't respond.\n\n{error_msg}"
-                try:
-                    await _context.bot.send_message(
-                        chat_id=chat_id,
-                        text=reply,
-                        reply_to_message_id=reply_to_msg_id,
-                    )
-                except Exception:
-                    pass
-        finally:
-            _current_task = None  # Clean up task reference
-
-    global _current_task
-    _current_task = asyncio.create_task(_run_task(
-        chat_id=update.effective_chat.id,
-        reply_to_msg_id=confirm.message_id,
-        prompt=prompt,
-        image_path=image_path,
-    ))
+        # Submit task (non-blocking) and start monitor in background
+        bridge.send_task(prompt)
+        asyncio.create_task(_monitor_task_completion(confirm_msg, prompt))
 
 
 # ── Startup / Shutdown ──────────────────────────────────────────────────────
@@ -611,6 +613,7 @@ def main():
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("new", new_command))
     app.add_handler(CommandHandler("stop", stop_command))
+    app.add_handler(CommandHandler("cancel", cancel_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.PHOTO, handle_message))
     app.add_error_handler(error_handler)
