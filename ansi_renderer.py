@@ -95,6 +95,10 @@ class VirtualScreen:
                 # Regular character (including line-drawing chars)
                 if self._col >= self.cols:
                     self._col = 0
+                    self._row += 1
+                    if self._row >= self.rows:
+                        self._scroll_up()
+                        self._row = self.rows - 1
                 if self._row >= self.rows:
                     self._scroll_up()
                     self._row = self.rows - 1

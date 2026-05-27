@@ -275,6 +275,8 @@ npm install -g @anthropic-ai/claude-code
 claude --version
 ```
 
+> **DeepSeek backend note**: If you're using DeepSeek as your model backend (via `ANTHROPIC_BASE_URL` pointing to DeepSeek's API), you need **Claude Code CLI <= 0.2.6**. Later versions introduced `--thinking` mode and tool-breaking changes that are incompatible with DeepSeek's Anthropic API compatibility layer. Pin the version with `npm install -g @anthropic-ai/claude-code@0.2.6`.
+
 Note: If you're using a custom backend (Bedrock, Vertex, proxy), configure environment variables before this step (see [5.8 Model Backend Configuration](#58-model-backend-configuration)).
 
 ### 5.4 Clone & Install the Bridge

@@ -158,6 +158,10 @@ def is_prompt_detected(text: str) -> bool:
         candidate_count += 1
         if stripped and stripped[-1] in ">▶❯":
             return True
+        # Also check if prompt char appears as standalone on its own line
+        # (e.g., whitespace + "❯" + whitespace — common with ANSI rendering)
+        if re.search(r"^\s*[❯▶>]\s*$", stripped):
+            return True
         if candidate_count >= 5:
             # Looked at 5 significant lines, no prompt found
             return False

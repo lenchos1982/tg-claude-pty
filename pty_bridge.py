@@ -46,6 +46,13 @@ START_TIMEOUT = 90.0  # max seconds for full startup (including dialogs + drain)
 DEFAULT_RESPONSE_TIMEOUT = 0  # unlimited — wait indefinitely for Claude to finish
 ABSOLUTE_MAX_WAIT = 1800.0  # 30 min — hard safety cap, returns whatever is available
 DIALOG_ENTER_INTERVAL = 1.5  # seconds between Enter presses during startup
+
+# Startup-phase guard: in --bare mode, Claude outputs spurious prompt
+# characters (❯) during settings check, doctor, plugin sync, etc.
+# Any ❯/▶/> detected within this window after process start is
+# considered startup noise and ignored for completion/prompt-ready.
+STARTUP_PHASE_SECS = 45.0  # seconds after process spawn to suppress prompt detection
+
 PTY_ROWS = 100
 PTY_COLS = 200
 
@@ -137,6 +144,24 @@ class PtyBridge:
         self._last_auth_response = 0.0  # timestamp of last auto-y
         self._auth_debounce_secs = 5.0  # min seconds between auto-responses
 
+        # Startup-phase guard: suppress prompt detection during
+        # --bare mode startup noise (settings, doctor, plugin sync).
+        self._startup_until = 0.0
+
+        # ── Task Mode (non-blocking dispatch) ──
+        self._task_mode = False
+        self._task_prompt = ""
+        self._task_start_time = 0.0
+        self._task_completed = threading.Event()
+        self._task_result = ""
+        self._task_cancelled = threading.Event()
+        self._task_send_start_pos = 0
+
+        # Prompt stability tracking (for improved completion detection)
+        self._prompt_first_seen = 0.0
+        self._prompt_stable_since = 0.0
+        self._last_stable_buffer_len = 0
+
         # Async bridge (set during start())
         self._loop: Optional[asyncio.AbstractEventLoop] = None
 
@@ -196,6 +221,34 @@ class PtyBridge:
         text = tail.decode("utf-8", errors="replace")
         return strip_ansi(text)
 
+    def set_task_mode(self, enabled: bool):
+        """Switch between task mode and conversation mode.
+
+        Args:
+            enabled: True = task mode, False = conversation mode.
+        """
+        self._task_mode = enabled
+        self._task_completed.clear()
+        self._task_cancelled.clear()
+        # Reset prompt stability tracking when switching modes
+        self._prompt_first_seen = 0.0
+        self._prompt_stable_since = 0.0
+        self._last_stable_buffer_len = 0
+        # Reset send start pos to prevent reader thread from re-triggering
+        # completion detection on stale prompt position.
+        self._task_send_start_pos = 0
+        logger.info("Task mode %s", "enabled" if enabled else "disabled")
+
+    @property
+    def task_mode(self) -> bool:
+        """Check if currently in task mode."""
+        return self._task_mode
+
+    @property
+    def task_active(self) -> bool:
+        """Check if a task is currently running (task mode + not completed)."""
+        return self._task_mode and not self._task_completed.is_set()
+
     def reset(self):
         """Reset internal state for a fresh session (call after stop)."""
         self._buffer.clear()
@@ -205,9 +258,16 @@ class PtyBridge:
         self._send_prompt_watermark = 0
         self._output_burst_count = 0
         self._last_output_burst = 0.0
-        self._last_data_time = 0.0  # Prevent stale timing from old session
-        self._send_start_time = 0.0  # Prevent stale timing from old session
-        self._send_start_pos = 0
+        self._task_mode = False
+        self._task_prompt = ""
+        self._task_start_time = 0.0
+        self._task_completed.clear()
+        self._task_result = ""
+        self._task_cancelled.clear()
+        self._task_send_start_pos = 0
+        self._prompt_first_seen = 0.0
+        self._prompt_stable_since = 0.0
+        self._last_stable_buffer_len = 0
         self._prompt_ready_event.set()  # Reset to ready so next send doesn't block
 
     # ── Start / Stop ────────────────────────────────────────────────────
@@ -366,6 +426,307 @@ class PtyBridge:
         # Mark the clean buffer position for future send() calls
         self._send_prompt_watermark = len(self._buffer)
 
+        # ── Startup-phase guard ──
+        # Defer prompt detection for STARTUP_PHASE_SECS to let Claude's
+        # --bare startup garbage (settings issues, doctor, plugin sync)
+        # flush through without triggering false completion events.
+        self._startup_until = time.monotonic() + STARTUP_PHASE_SECS
+        logger.info(
+            "Startup complete; deferring prompt detection for %.0fs "
+            "(--bare startup garbage flush)",
+            STARTUP_PHASE_SECS,
+        )
+
+    # ═══ Send Task (non-blocking) ═══════════════════════════════════════
+
+    def send_task(self, text: str) -> str:
+        """
+        Submit a task to Claude Code and return immediately.
+
+        Unlike send(), this does NOT wait for a response. It writes the
+        prompt to the PTY, records the start position, and returns a
+        confirmation string. Callers must monitor _task_completed event
+        to know when the task finishes.
+
+        Args:
+            text: The task prompt to send to Claude.
+
+        Returns:
+            A confirmation message string.
+
+        Raises:
+            RuntimeError: If bridge is not ready.
+        """
+        if not self._ready:
+            raise RuntimeError("PtyBridge is not ready. Call start() first.")
+
+        # Wait for prompt-ready to prevent input stacking.
+        # Skip if we're still in startup phase — Claude may not have
+        # signalled prompt-ready yet but is actually at its prompt.
+        if not self._prompt_ready_event.is_set() and time.monotonic() >= self._startup_until:
+            logger.info("Claude not at prompt — waiting for it to finish...")
+            self._wait_for_prompt_ready(timeout=60.0)
+
+        # Prepare task mode state
+        self._task_mode = True
+        self._task_prompt = text
+        self._task_start_time = time.monotonic()
+        self._task_completed.clear()
+        self._task_cancelled.clear()
+        self._task_result = ""
+        self._sent_text = text
+
+        # Record buffer start position
+        with self._buf_lock:
+            self._task_send_start_pos = len(self._buffer)
+
+        # Clear prompt-ready — will be set when prompt reappears
+        self._prompt_ready_event.clear()
+        self._prompt_first_seen = 0.0
+        self._prompt_stable_since = 0.0
+        self._last_stable_buffer_len = 0
+
+        # Write to PTY master
+        logger.info("send_task: submitting task (%d chars)", len(text))
+        os.write(self._master_fd, (text + "\r").encode())
+
+        # \u2500\u2500 Echo Skip Phase \u2500\u2500
+        # Wait for the terminal echo to appear, then advance
+        # _task_send_start_pos past it. This prevents two problems:
+        #   1. Echo lines leaking into the final rendered output
+        #   2. The prompty character (\u276f) in the echo line confusing the
+        #      reader thread's prompt-detection logic, causing Claude's
+        #      real response to be truncated (premature completion).
+        echo_skip_deadline = time.monotonic() + 15.0
+        while time.monotonic() < echo_skip_deadline:
+            if not self._running:
+                break
+            with self._buf_lock:
+                cur_len = len(self._buffer)
+            new_bytes_count = cur_len - self._task_send_start_pos
+            if new_bytes_count >= len(text.encode("utf-8", errors="replace")) + 1:
+                with self._buf_lock:
+                    new_bytes = bytes(self._buffer[self._task_send_start_pos:cur_len])
+                if self._echo_detected(new_bytes, text):
+                    raw_content = new_bytes.decode("utf-8", errors="replace")
+                    echo_end_marker = -1
+                    for marker in (text + "\r", text + "\n", text):
+                        idx = raw_content.find(marker)
+                        if idx >= 0:
+                            echo_end_marker = idx + len(marker)
+                            break
+                    if echo_end_marker >= 0:
+                        nl_after = raw_content.find("\n", echo_end_marker)
+                        if nl_after >= 0:
+                            new_pos = self._task_send_start_pos + nl_after + 1
+                        else:
+                            new_pos = self._task_send_start_pos + echo_end_marker
+                        with self._buf_lock:
+                            if new_pos <= len(self._buffer):
+                                self._task_send_start_pos = new_pos
+                        logger.debug("send_task: echo skipped for '%s'", text[:50])
+                    break
+            time.sleep(0.15)
+
+        return "\u2705 \u4efb\u52d9\u5df2\u63a5\u6536\uff0c\u5c07\u5728\u80cc\u666f\u57f7\u884c"
+
+    # ═══ Wait for Task Completion (sync helper) ═════════════════════════
+
+    def _wait_for_task_completion(self, timeout: float) -> bool:
+        """Block until task completes or timeout. Returns False if timed out.
+
+        Watches _task_completed event with a 1-second polling interval.
+        Harcapped at TASK_DEFAULT_TIMEOUT.
+        """
+        from config import TASK_DEFAULT_TIMEOUT
+
+        start_wait = time.monotonic()
+        effective_timeout = TASK_DEFAULT_TIMEOUT if timeout <= 0 else min(timeout, TASK_DEFAULT_TIMEOUT)
+
+        while not self._task_completed.wait(timeout=1.0):
+            if not self._running:
+                return False
+            if time.monotonic() - start_wait >= effective_timeout:
+                logger.warning(
+                    "Task completion wait timeout (%.0fs) — returning",
+                    effective_timeout,
+                )
+                return False
+        return True
+
+    # ═══ Cancel Current Task ════════════════════════════════════════════
+
+    def cancel_current_task(self):
+        """
+        Cancel the currently running task immediately.
+
+        Uses a phased approach:
+        1. Set the _task_cancelled event to signal monitoring loop
+        2. Send Ctrl+C (\x03) to the PTY
+        3. Wait up to 3s for Claude's prompt to return
+        4. If not ready, send Enter and wait 3s more
+        5. If still not ready, SIGTERM the Claude process
+        6. Set _task_completed to unblock monitoring loop
+        7. Switch back to conversation mode
+        """
+        logger.info("Cancel requested for current task")
+        self._task_cancelled.set()
+
+        # Phase 1: Ctrl+C
+        try:
+            os.write(self._master_fd, b"\x03")
+        except OSError:
+            pass
+
+        # Phase 2: wait 3s for prompt to return
+        time.sleep(3.0)
+        if self._prompt_ready_event.is_set():
+            logger.info("Task cancelled — prompt returned after Ctrl+C")
+            self._task_completed.set()
+            self.set_task_mode(False)
+            return
+
+        # Phase 3: send Enter and wait 3s more
+        try:
+            os.write(self._master_fd, b"\r")
+        except OSError:
+            pass
+        time.sleep(3.0)
+        if self._prompt_ready_event.is_set():
+            logger.info("Task cancelled — prompt returned after Enter")
+            self._task_completed.set()
+            self.set_task_mode(False)
+            return
+
+        # Phase 4: SIGTERM + auto-restart
+        proc = self._process
+        if proc is not None and proc.returncode is None:
+            logger.warning("Task cancel: sending SIGTERM to Claude")
+            try:
+                os.kill(proc.pid, signal.SIGTERM)
+                proc.wait(5.0)
+            except (ProcessLookupError, subprocess.TimeoutExpired):
+                pass
+            self._ready = False
+            self._running = False
+
+        self._task_completed.set()
+        self.set_task_mode(False)
+        logger.info("Task cancelled — SIGTERM sent, triggering auto-restart")
+
+        # Auto-restart the bridge
+        try:
+            success = self.restart_sync()
+            if success:
+                logger.info("Bridge auto-restarted after cancel")
+                self._ready = True
+                self._running = True
+                self._prompt_ready_event.set()
+            else:
+                logger.error("Bridge auto-restart after cancel FAILED")
+        except Exception as e:
+            logger.error("Bridge auto-restart after cancel raised exception: %s", e)
+
+    def restart_sync(self) -> bool:
+        """Restart the bridge synchronously. Returns True if successful.
+
+        Stops the current Claude process (if alive), resets state,
+        and starts a fresh session. Safe to call from any thread.
+
+        Returns:
+            True if restart succeeded and bridge is ready.
+        """
+        import signal as _signal
+
+        logger.info("Restarting bridge synchronously...")
+
+        # Stop existing process
+        proc = self._process
+        if proc is not None and proc.returncode is None:
+            try:
+                os.kill(proc.pid, _signal.SIGINT)
+                proc.wait(timeout=5.0)
+            except (ProcessLookupError, subprocess.TimeoutExpired, OSError):
+                try:
+                    os.kill(proc.pid, _signal.SIGTERM)
+                    proc.wait(timeout=3.0)
+                except (ProcessLookupError, subprocess.TimeoutExpired, OSError):
+                    pass
+
+        self._cleanup()
+        self.reset()
+
+        # Start fresh and wait for startup to complete
+        try:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            self.start(loop)
+            loop.close()
+            # After start(), the bridge may still be in startup phase.
+            # Poll up to START_TIMEOUT + 5s for ready to become True.
+            deadline = time.monotonic() + 95.0  # START_TIMEOUT(90) + buffer(5)
+            while time.monotonic() < deadline:
+                if self._ready:
+                    logger.info("Bridge restart successful (ready after %.1fs)",
+                                time.monotonic() - deadline + 95.0)
+                    return True
+                time.sleep(0.5)
+            logger.error("Bridge restart timed out waiting for ready state")
+            return False
+        except Exception as e:
+            logger.error("Bridge restart failed: %s", e)
+            return False
+
+    # ═══ Extract Task Summary ══════════════════════════════════════════
+
+    def _extract_task_summary(self) -> str:
+        """
+        Extract a summarized version of the task's output from the buffer.
+
+        Reads from _task_send_start_pos to current buffer end, renders
+        through VirtualScreen, cleans TUI artifacts, and compresses to
+        TASK_SUMMARY_MAX_LENGTH if needed.
+
+        Returns:
+            Cleaned summary string. Empty string if no content available.
+        """
+        from config import TASK_SUMMARY_MAX_LENGTH
+
+        # Get raw bytes from buffer since task start
+        with self._buf_lock:
+            if self._task_send_start_pos <= 0 or self._task_send_start_pos >= len(self._buffer):
+                return ""
+            new_bytes = bytes(self._buffer[self._task_send_start_pos:])
+
+        raw = new_bytes.decode("utf-8", errors="replace")
+        if not raw.strip():
+            return ""
+
+        # Render through VirtualScreen
+        screen = VirtualScreen(rows=PTY_ROWS, cols=PTY_COLS)
+        rendered = screen.render(raw)
+
+        # Clean output
+        cleaned = self._clean_output(rendered)
+        if not cleaned:
+            return ""
+
+        # Compress if too long
+        if len(cleaned) > TASK_SUMMARY_MAX_LENGTH:
+            head_ratio = 0.3
+            tail_ratio = 0.2
+            head_end = int(len(cleaned) * head_ratio)
+            tail_start = int(len(cleaned) * (1 - tail_ratio))
+            head = cleaned[:head_end].rstrip()
+            tail = cleaned[tail_start:].lstrip()
+            middle_len = len(cleaned) - head_end - (len(cleaned) - tail_start)
+            compressed = (
+                f"{head}\n\n...\uff08\u7701\u7565 {middle_len} \u5b57\u5143\uff09...\n\n{tail}"
+            )
+            return compressed
+
+        return cleaned
+
     async def stop(self):
         """Stop Claude Code gracefully: SIGINT → SIGTERM → SIGKILL."""
         self._ready = False
@@ -474,10 +835,63 @@ class PtyBridge:
         # Write to PTY master (\r = Enter in raw terminal mode)
         os.write(self._master_fd, (text + "\r").encode())
 
+        # ── Echo Skip Phase ────────────────────────────────────────────
+        # Terminal echoes user input. We wait for the echo to appear in
+        # the buffer, then advance start_pos past it so the VirtualScreen
+        # render doesn't include it in the response.
+        # 15-second window: Claude --bare mode may take several seconds
+        # to render the input display (especially with large context).
+        echo_skip_deadline = time.monotonic() + 15.0
+        echo_skipped = False
+        while time.monotonic() < echo_skip_deadline:
+            if not self._running:
+                break
+            with self._buf_lock:
+                new_bytes = bytes(self._buffer[start_pos:])
+            if len(new_bytes) >= len(text.encode("utf-8", errors="replace")) + 1:
+                if self._echo_detected(new_bytes, text):
+                    # Find echo end in buffer — advance to after the echo line
+                    raw_content = new_bytes.decode("utf-8", errors="replace")
+                    # Find echo content + following newline
+                    echo_end_marker = -1
+                    for marker in (text + "\r", text + "\n", text):
+                        idx = raw_content.find(marker)
+                        if idx >= 0:
+                            echo_end_marker = idx + len(marker)
+                            break
+                    if echo_end_marker >= 0:
+                        # Advance to after the echo line's newline
+                        nl_after = raw_content.find("\n", echo_end_marker)
+                        if nl_after >= 0:
+                            start_pos += nl_after + 1
+                        else:
+                            start_pos += echo_end_marker
+                    echo_skipped = True
+                    logger.debug("Echo detected and skipped for '%s'", text[:50])
+                    break
+            time.sleep(0.15)
+
+        # Update send tracking with potentially adjusted start_pos
+        self._send_start_pos = start_pos
+        self._send_prompt_watermark = start_pos
+
+        # ── Re-clear response event after echo skip ────────────────────
+        # The reader thread runs independently and may have detected a
+        # prompt character in the echo output (e.g., "❯ 你好") and set
+        # _response_event during the echo skip phase. If we proceed to
+        # _wait_for_response with the event already set, it returns
+        # immediately with an empty response — the user sees only their
+        # own text echoed back while Claude is still thinking.
+        #
+        # Re-clearing here ensures only prompts appearing AFTER this
+        # point (Claude's real post-response prompt) trigger completion.
+        self._response_event.clear()
+
         # Auth prompt detection has been moved to the reader thread
         # (_check_and_respond_auth). It runs continuously during
         # response collection, so auth prompts appearing at any point
-        # in Claude's execution are handled.
+        # in Claude's execution are handled — not just those visible
+        # in the first 15s of send().
 
         # ── Wait for Response ───────────────────────────────────────────
         loop = asyncio.get_running_loop()
@@ -524,8 +938,9 @@ class PtyBridge:
         # If the cleaned result looks suspiciously like just the echo of
         # what we sent, try fallback extraction from raw PTY output.
         # Skip for very short messages (<=3 chars): Claude's response to
-        # short input may be short and have high similarity to the prompt,
-        # causing false-positive echo detection and blank replies.
+        # short input may be short and have high similarity to the prompt
+        # text itself (e.g. Chinese greeting), causing false-positive echo
+        # detection and blank replies.
         if (cleaned and self._sent_text and len(self._sent_text) > 3
                 and len(cleaned) <= len(self._sent_text) + 10):
             from difflib import SequenceMatcher
@@ -654,65 +1069,107 @@ class PtyBridge:
                 # new data arrives. Handles auth prompts that appear mid-
                 # execution (e.g. 3rd sub-task needs sudo), not just those
                 # visible at send() start. 5s debounce prevents spamming.
-                if self._expecting_response:
+                # In pure task mode, always checks when a task is active.
+                if self._expecting_response or (
+                    self._task_send_start_pos > 0 and not self._task_completed.is_set()
+                ):
                     self._check_and_respond_auth()
 
-            # ── Response completion detection ────────────────────────
-            # Only ONE condition triggers completion:
-            #    Prompt character (❯/▶/>) detected in NEW output
-            #    (i.e. output that appeared AFTER send() started).
-            #
-            # Silence timeout is DELIBERATELY not used. It was a
-            # source of premature cutoffs for long-running commands.
-            # The reader thread waits indefinitely for Claude to
-            # finish; an absolute max-wait safety net (1800s) is in
-            # _wait_for_response() instead.
-            #
-            # Output burst tracking is logged for observability but
-            # does not affect completion logic.
+            # ── Response completion detection (send mode) ────────────
             if self._expecting_response and self._last_data_time > 0:
                 elapsed = now - self._send_start_time
 
-                # Log burst activity for observability (debug only)
                 if self._output_burst_count >= 3:
                     silence = now - self._last_data_time
                     if silence > 10.0 and self._output_burst_count % 5 == 0:
                         logger.debug(
-                            "Burst=%d active, elapsed=%.0fs, silence=%.0fs — "
-                            "waiting for prompt (not using silence timeout)",
+                            "Burst=%d active, elapsed=%.0fs, silence=%.0fs",
                             self._output_burst_count, elapsed, silence,
                         )
 
-                # Prompt-based completion: only trigger if prompt
-                # appeared in content written AFTER send() started.
-                #
-                # The re-clear of _response_event after echo skip (in send())
-                # ensures that prompt characters from the echo display line
-                # (e.g., "❯ 你好") do NOT trigger premature completion.
-                #
-                # CRITICAL: Claude --bare mode redraws its TUI frequently
-                # during a response, showing the prompt character multiple
-                # times before completion. To prevent premature cutoffs,
-                # we require a quiet period AFTER prompt detection before
-                # signalling completion. If new data arrives during the
-                # quiet window, the timer resets.
                 if elapsed >= 0.5:
                     prompt_detected, prompt_pos = self._check_prompt_detected_with_pos()
                     if prompt_detected and prompt_pos > self._send_prompt_watermark:
-                        # Prompt seen. Must have a stable quiet period
-                        # (no new PTY output) before we accept completion.
-                        quiet_needed = 2.0  # seconds of silence after prompt
+                        quiet_needed = 2.0
                         if self._last_data_time > 0:
                             silence = now - self._last_data_time
                             if silence >= quiet_needed:
                                 self._response_event.set()
-                            # else: prompt seen but data still arriving — keep waiting
+
+            # ── Heartbeat / stall logging (task mode) ───────────────
+            if self._task_send_start_pos > 0 and not self._task_completed.is_set():
+                from config import BUFFER_STALL_TIMEOUT, HEARTBEAT_INTERVAL as _cfg_hb
+
+                # Buffer stall detection
+                data_silence = now - self._last_data_time
+                if data_silence >= BUFFER_STALL_TIMEOUT and self._last_data_time > 0:
+                    elapsed = now - self._task_start_time if self._task_start_time > 0 else 0.0
+                    logger.warning(
+                        "BUFFER STALL: no new data for %.0fs (elapsed=%.0fs) — "
+                        "task may be hung, waiting for prompt",
+                        data_silence, elapsed,
+                    )
+
+                # Periodic heartbeat log
+                elapsed = now - self._task_start_time if self._task_start_time > 0 else 0.0
+                if elapsed >= _cfg_hb and int(elapsed) % int(_cfg_hb) == 0 and int(elapsed) > 0:
+                    with self._buf_lock:
+                        buf_growth = len(self._buffer) - self._task_send_start_pos
+                    logger.debug(
+                        "HEARTBEAT: task running for %.0fs, buffer grown by %d bytes, "
+                        "silence=%.0fs, burst_count=%d",
+                        elapsed, buf_growth, data_silence, self._output_burst_count,
+                    )
+
+            # ── Task completion detection (prompt stability) ──────
+            if self._task_send_start_pos > 0 and not self._task_completed.is_set():
+                elapsed = now - self._task_start_time if self._task_start_time > 0 else 0.0
+
+                if self._output_burst_count >= 3:
+                    silence = now - self._last_data_time
+                    if silence > 10.0 and self._output_burst_count % 5 == 0:
+                        logger.debug(
+                            "Burst=%d active, elapsed=%.0fs, silence=%.0fs",
+                            self._output_burst_count, elapsed, silence,
+                        )
+
+                # Prompt-based completion with stability tracking
+                if elapsed >= 0.5:
+                    prompt_detected, prompt_pos = self._check_prompt_detected_with_pos()
+                    if prompt_detected and prompt_pos > self._task_send_start_pos:
+                        if self._prompt_first_seen == 0.0:
+                            self._prompt_first_seen = now
+                            self._prompt_stable_since = None
+                            self._last_stable_buffer_len = len(self._buffer)
+                        elif now - self._prompt_first_seen >= 2.0:
+                            if self._prompt_stable_since is None:
+                                self._prompt_stable_since = now
+                                self._last_stable_buffer_len = len(self._buffer)
+                            cur_len = len(self._buffer)
+                            if cur_len > self._last_stable_buffer_len:
+                                self._prompt_stable_since = now
+                                self._last_stable_buffer_len = cur_len
+                            if self._prompt_stable_since is not None:
+                                if now - self._prompt_stable_since >= 3.0:
+                                    logger.info(
+                                        "Task completed — prompt stable for 3.0s after %.0fs",
+                                        elapsed,
+                                    )
+                                    self._task_completed.set()
+                                    self._task_result = self._extract_task_summary()
+                    else:
+                        self._prompt_first_seen = 0.0
+                        self._prompt_stable_since = 0.0
 
             # ── Prompt-ready detection (for input-stacking prevention) ──
             # Set prompt_ready_event when Claude shows its prompt AND we
             # are NOT currently waiting for a send() response. This signals
             # to the next send() caller that Claude is ready to accept input.
-            if not self._expecting_response:
+            # Startup-phase guard: suppress prompt detection during startup
+            # noise window to avoid spurious prompt-ready signals.
+            if now < self._startup_until:
+                pass  # Still in startup phase — ignore all prompt signals
+            elif not self._expecting_response:
                 prompt_detected, _ = self._check_prompt_detected_with_pos()
                 if prompt_detected:
                     self._prompt_ready_event.set()
@@ -908,6 +1365,13 @@ class PtyBridge:
             if cls._is_horizontal_rule_line(stripped):
                 continue
 
+            # ── Framed lines: ─── content ─── or === content === ──
+            # Claude Code's TUI uses hr-like framing around section
+            # titles (e.g. "─── Standard Output ───" or "----- stderr -----").
+            # These are chrome, not content — filter them out.
+            if re.match(r"^[─━═\-]{2,}\s*.+?\s*[─━═\-]{2,}$", stripped):
+                continue
+
             # ── Claude file-reading section headers ────────────────────
             # When Claude reads code (especially multi-file), it emits
             # "--- path/to/file.ext ---" separators and VirtualScreen
@@ -1045,10 +1509,9 @@ class PtyBridge:
         for i, placeholder in enumerate(placeholders):
             if placeholder in rendered:
                 rendered = rendered.replace(placeholder, code_blocks[i])
-            elif code_blocks[i] not in rendered:
-                # Placeholder was removed by filtering (protocol suppression,
-                # status-line removal, etc.). Re-append the code block at the
-                # end — loses context but preserves content.
+            else:
+                # Placeholder may have been absorbed by blank-line collapse
+                # or other transforms. Re-append at the end.
                 rendered = rendered.rstrip() + "\n\n" + code_blocks[i]
 
         # ── Safety fallback ──
@@ -1061,6 +1524,8 @@ class PtyBridge:
                 if cls._is_horizontal_rule_line(s):
                     continue
                 if cls._is_file_header_line(s):
+                    continue
+                if re.match(r"^[─━═\-]{2,}\s*.+?\s*[─━═\-]{2,}$", s):
                     continue
                 if re.match(r"^\s*[❯>▶]\s*$", s):
                     continue
@@ -1299,16 +1764,55 @@ class PtyBridge:
     @staticmethod
     def _echo_detected(new_data: bytes, sent_text: str) -> bool:
         """
-        Echo detection — always returns False.
+        Check if new PTY output contains a terminal echo of the sent text.
 
-        In non-bare Task mode (the only operating mode), Claude Code does
-        NOT echo user input with a prompt prefix. The kernel PTY echo is
-        raw bytes that VirtualScreen naturally overwrites. No echo skip
-        is needed.
-
-        This method is kept as a static stub for compatibility; the
-        echo-skip phase in send() was replaced with a brief settle sleep.
+        Three strategies, from most to least strict:
+          1. Prompt character + sent_text: "❯ hello" (most reliable)
+          2. Short-message leniency: messages <=3 chars checked in head
+          3. Multi-line matching: each line checked separately
         """
+        if not new_data or not sent_text:
+            return False
+
+        try:
+            decoded = new_data.decode("utf-8", errors="replace")
+        except Exception:
+            return False
+
+        from output_parser import strip_ansi
+        clean = strip_ansi(decoded)
+
+        # Strategy 1: prompt-char + sent_text (most reliable)
+        for prompt_char in ("❯", ">", "▶"):
+            pattern = re.escape(prompt_char) + r"\s*" + re.escape(sent_text)
+            if re.search(pattern, clean, re.DOTALL):
+                return True
+
+        # Strategy 2: short messages (<=3 chars) — echo may be embedded
+        if len(sent_text) <= 3:
+            head = clean[:200]
+            if sent_text in head:
+                idx = head.find(sent_text)
+                if idx == 0:
+                    return True
+                prefix = head[idx - 1] if idx > 0 else ""
+                if prefix in (" ", ">", "❯", "▶", "\n", "\r", "\t"):
+                    return True
+
+        # Strategy 3: multi-line sent_text
+        if "\n" in sent_text:
+            lines = sent_text.split("\n")
+            matched_lines = 0
+            for line in lines:
+                stripped_line = line.strip()
+                if not stripped_line:
+                    matched_lines += 1
+                    continue
+                if stripped_line in clean:
+                    matched_lines += 1
+            if matched_lines > len(lines) * 0.5:
+                return True
+
         return False
 
     @staticmethod
