@@ -524,6 +524,16 @@ class PtyBridge:
                         with self._buf_lock:
                             if new_pos <= len(self._buffer):
                                 self._task_send_start_pos = new_pos
+                        # Reset prompt detection state in reader thread.
+                        # The reader thread may have already detected a prompt
+                        # character (❯) from the partial echo line and started
+                        # the stability timer. After advancing past the echo,
+                        # reset the timer so prompt detection restarts from
+                        # the new position — otherwise the stale timer would
+                        # fire after 5s regardless of real completion.
+                        self._prompt_first_seen = 0.0
+                        self._prompt_stable_since = 0.0
+                        self._last_stable_buffer_len = 0
                         logger.debug("send_task: echo skipped for '%s'", text[:50])
                     break
             time.sleep(0.15)
