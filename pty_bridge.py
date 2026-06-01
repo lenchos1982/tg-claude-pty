@@ -321,7 +321,7 @@ class PtyBridge:
         # Build claude command with optional session ID
         # Non-bare mode: Claude loads ~/.claude/CLAUDE.md (global dev rules)
         # in addition to --system-prompt-file. The two merge cleanly —
-        # /root/chuxi/CLAUDE.md sets output format rules, ~/.claude/CLAUDE.md
+        # /root/tg-claude-pty/.claude/CLAUDE.md sets output format rules, ~/.claude/CLAUDE.md
         # sets coding discipline rules. No conflict.
         # --settings: explicitly point to project-level settings file so
         #   permissions.allow rules are loaded even in --bare mode.
@@ -337,7 +337,7 @@ class PtyBridge:
             self._claude_bin,
             "--permission-mode", "auto",
             "--settings", settings_path,
-            "--system-prompt-file", "/root/chuxi/CLAUDE.md",
+            "--system-prompt-file", "/root/tg-claude-pty/.claude/CLAUDE.md",
         ]
         if self._session_id:
             cmd.extend(["--session-id", self._session_id])
@@ -491,12 +491,21 @@ class PtyBridge:
         if not self._ready:
             raise RuntimeError("PtyBridge is not ready. Call start() first.")
 
-        # Wait for prompt-ready to prevent input stacking.
-        # Skip if we're still in startup phase \u2014 Claude may not have
-        # signalled prompt-ready yet but is actually at its prompt.
+        # ── Brief wait for PTY Claude to reach prompt ──
+        # In V2, output comes from claude -p --continue (independent
+        # subprocess), NOT from the PTY.  The PTY write is only needed
+        # to keep the interactive session alive and in sync.  We wait
+        # briefly (5s) to avoid stacking input while Claude is mid-
+        # operation, but we don't block long because:
+        #   1. claude -p --continue doesn't need the PTY to be at prompt
+        #   2. Even if we write while Claude is busy, the PTY output
+        #      is unused — only claude -p stdout matters
+        #   3. 60s was hurting UX with no benefit in V2 architecture
         if not self._prompt_ready_event.is_set() and time.monotonic() >= self._startup_until:
-            logger.info("Claude not at prompt \u2014 waiting for it to finish...")
-            self._wait_for_prompt_ready(timeout=60.0)
+            logger.info("Claude not at prompt — waiting briefly (5s)...")
+            ready = self._wait_for_prompt_ready(timeout=5.0)
+            if not ready:
+                logger.info("Claude still not at prompt after 5s — sending anyway")
 
         # Prepare task mode state
         self._task_mode = True
@@ -613,7 +622,7 @@ class PtyBridge:
             "--output-format", "text",
             "--permission-mode", "auto",
             "--settings", settings_path,
-            "--system-prompt-file", "/root/chuxi/CLAUDE.md",
+            "--system-prompt-file", "/root/tg-claude-pty/.claude/CLAUDE.md",
             text,  # prompt as positional argument
         ]
         timeout = TASK_DEFAULT_TIMEOUT
