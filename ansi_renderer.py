@@ -16,6 +16,7 @@ Handles:
   - All other ANSI sequences — stripped
 """
 
+import copy
 import re
 from typing import List
 
@@ -332,6 +333,40 @@ class VirtualScreen:
             self._screen.pop(0)
             self._screen.append([" "] * self.cols)
         self._row = max(0, min(self.rows - 1, self._row - n))
+
+    def snapshot(self) -> List[List[str]]:
+        """Return a deep copy of the current screen state."""
+        return copy.deepcopy(self._screen)
+
+    def get_new_text_since(self, snapshot: List[List[str]]) -> str:
+        """Return text from rows added since the given snapshot.
+
+        Finds the last non-empty row in the snapshot, then returns all
+        text from that row+1 to the last non-empty row in the current
+        screen. If the snapshot is empty or None, returns all text.
+        """
+        if not snapshot:
+            return self.get_text()
+
+        # Find the last non-empty row in the snapshot
+        last_snapshot_row = -1
+        for r in range(len(snapshot) - 1, -1, -1):
+            if any(c != " " for c in snapshot[r]):
+                last_snapshot_row = r
+                break
+
+        # Collect rows from last_snapshot_row+1 to last non-empty in current screen
+        lines = []
+        start_row = max(0, last_snapshot_row + 1)
+        for r in range(start_row, self.rows):
+            line = "".join(self._screen[r]).rstrip()
+            lines.append(line)
+
+        # Strip trailing empty lines
+        while lines and not lines[-1]:
+            lines.pop()
+
+        return "\n".join(lines)
 
     def get_text(self) -> str:
         """Get the visible text, preserving empty lines for paragraph breaks."""

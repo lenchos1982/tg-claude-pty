@@ -53,6 +53,12 @@ DIALOG_ENTER_INTERVAL = 1.5  # seconds between Enter presses during startup
 # considered startup noise and ignored for completion/prompt-ready.
 STARTUP_PHASE_SECS = 45.0  # seconds after process spawn to suppress prompt detection
 
+# Buffer size cap: maximum bytes the raw PTY buffer can hold before
+# old data is trimmed.  Prevents unbounded memory growth in long-
+# running sessions.  All positional references (_task_send_start_pos,
+# _send_prompt_watermark, etc.) are adjusted during trim.
+MAX_BUFFER_BYTES = 10 * 1024 * 1024  # 10 MiB
+
 PTY_ROWS = 100
 PTY_COLS = 200
 
@@ -161,6 +167,10 @@ class PtyBridge:
         self._prompt_first_seen = 0.0
         self._prompt_stable_since = 0.0
         self._last_stable_buffer_len = 0
+
+        # Persistent VirtualScreen for diff-based task output extraction
+        self._task_screen: Optional[VirtualScreen] = None
+        self._task_screen_snapshot: Optional[list] = None
 
         # Async bridge (set during start())
         self._loop: Optional[asyncio.AbstractEventLoop] = None
@@ -351,6 +361,9 @@ class PtyBridge:
         self._reader_thread = threading.Thread(target=self._reader_loop, daemon=True)
         self._reader_thread.start()
 
+        # Persistent VirtualScreen for diff-based task output extraction
+        self._task_screen = VirtualScreen(rows=PTY_ROWS, cols=PTY_COLS)
+
         # Startup loop: send Enter to dismiss dialogs, wait for silence
         startup_start = time.monotonic()
         deadline = startup_start + START_TIMEOUT
@@ -480,6 +493,9 @@ class PtyBridge:
         with self._buf_lock:
             self._task_send_start_pos = len(self._buffer)
 
+        # Snapshot VirtualScreen for diff-based content extraction
+        self._task_screen_snapshot = self._task_screen.snapshot() if self._task_screen else None
+
         # Clear prompt-ready — will be set when prompt reappears
         self._prompt_ready_event.clear()
         self._prompt_first_seen = 0.0
@@ -534,6 +550,15 @@ class PtyBridge:
                         self._prompt_first_seen = 0.0
                         self._prompt_stable_since = 0.0
                         self._last_stable_buffer_len = 0
+                        # ── Re-snapshot VirtualScreen after echo skip ──
+                        # The initial snapshot (taken before the PTY write)
+                        # doesn't include the echo line. After the reader
+                        # thread has fed the echo data, re-snapshot here
+                        # so get_new_text_since() correctly starts after
+                        # the echo region — preventing old screen content
+                        # from appearing as "new" in the task result.
+                        if self._task_screen is not None:
+                            self._task_screen_snapshot = self._task_screen.snapshot()
                         logger.debug("send_task: echo skipped for '%s'", text[:50])
                     break
             time.sleep(0.15)
@@ -693,31 +718,48 @@ class PtyBridge:
         """
         Extract a summarized version of the task's output from the buffer.
 
-        Reads from _task_send_start_pos to current buffer end, renders
-        through VirtualScreen, cleans TUI artifacts, and compresses to
-        TASK_SUMMARY_MAX_LENGTH if needed.
+        Primary: uses VirtualScreen diff (snapshot → current) for clean
+        extraction that excludes TUI chrome.  Fallback: raw buffer
+        extraction when the diff yields too little content.
 
         Returns:
             Cleaned summary string. Empty string if no content available.
         """
         from config import TASK_SUMMARY_MAX_LENGTH
 
-        # Get raw bytes from buffer since task start
-        with self._buf_lock:
-            if self._task_send_start_pos <= 0 or self._task_send_start_pos >= len(self._buffer):
-                return ""
-            new_bytes = bytes(self._buffer[self._task_send_start_pos:])
-
-        raw = new_bytes.decode("utf-8", errors="replace")
-        if not raw.strip():
-            return ""
-
-        # Render through VirtualScreen
-        screen = VirtualScreen(rows=PTY_ROWS, cols=PTY_COLS)
-        rendered = screen.render(raw)
+        rendered = ""
+        if self._task_screen is not None and self._task_screen_snapshot is not None:
+            rendered = self._task_screen.get_new_text_since(self._task_screen_snapshot)
 
         # Clean output
         cleaned = self._clean_output(rendered)
+
+        # ── Fallback: raw buffer extraction ─────────────────────────
+        # If the VirtualScreen diff yielded very little content (or empty),
+        # fall back to raw PTY buffer extraction.  This handles cases
+        # where Claude's ANSI cursor positioning causes VirtualScreen
+        # to miss output (e.g., when Claude overwrites the prompt area).
+        if (not cleaned or len(cleaned) < 60) and self._task_send_start_pos > 0:
+            with self._buf_lock:
+                raw_bytes = bytes(self._buffer[self._task_send_start_pos:])
+            if raw_bytes:
+                from output_parser import extract_content
+                raw_text = extract_content(raw_bytes.decode("utf-8", errors="replace"))
+                # Strip prompt line (echo) from the beginning
+                if self._task_prompt and raw_text.startswith(self._task_prompt[:min(len(self._task_prompt), 20)]):
+                    nl = raw_text.find("\n")
+                    if nl > 0:
+                        raw_text = raw_text[nl + 1:]
+                # Re-apply clean_output to the raw fallback
+                fallback_cleaned = self._clean_output(raw_text)
+                if fallback_cleaned and len(fallback_cleaned) > len(cleaned):
+                    logger.info(
+                        "_extract_task_summary: fallback extraction yielded "
+                        "%d chars (vs %d from VirtualScreen diff)",
+                        len(fallback_cleaned), len(cleaned),
+                    )
+                    cleaned = fallback_cleaned
+
         if not cleaned:
             return ""
 
@@ -781,6 +823,70 @@ class PtyBridge:
         self._cleanup()
 
     # ── Send / Receive ──────────────────────────────────────────────────
+
+    def _cleanup(self):
+        """Close PTY master fd and clean up process resources."""
+        self._ready = False
+        self._running = False
+        if self._master_fd is not None:
+            try:
+                os.close(self._master_fd)
+            except OSError:
+                pass
+            self._master_fd = None
+        # Reap child process if still alive
+        proc = self._process
+        if proc is not None and proc.returncode is None:
+            try:
+                proc.terminate()
+                proc.wait(timeout=3.0)
+            except (ProcessLookupError, subprocess.TimeoutExpired, OSError):
+                try:
+                    proc.kill()
+                    proc.wait(timeout=2.0)
+                except (ProcessLookupError, subprocess.TimeoutExpired, OSError):
+                    pass
+        # Don't set _process to None — callers may need returncode
+
+    def _trim_buffer_if_needed(self):
+        """
+        Trim the raw PTY buffer when it exceeds MAX_BUFFER_BYTES.
+
+        Preserves the most recent portion.  Adjusts all position-
+        tracking fields (_task_send_start_pos, _send_prompt_watermark,
+        _send_start_pos, _prompt_seen_pos) to stay consistent.
+
+        Must be called INSIDE _buf_lock.
+        """
+        buf_len = len(self._buffer)
+        if buf_len <= MAX_BUFFER_BYTES:
+            return
+
+        excess = buf_len - MAX_BUFFER_BYTES
+        # Keep the last MAX_BUFFER_BYTES — 1 MiB margin to avoid
+        # trimming on every append once near the boundary.
+        trim_to = MAX_BUFFER_BYTES - (1024 * 1024)  # keep ~9 MiB
+        discard = buf_len - trim_to
+        if discard <= 0:
+            return
+
+        # Trim the prefix
+        self._buffer = self._buffer[discard:]
+        offset = discard
+
+        # Adjust all positional references
+        self._task_send_start_pos = max(0, self._task_send_start_pos - offset)
+        self._send_start_pos = self._task_send_start_pos  # approximate
+        self._send_prompt_watermark = max(0, self._send_prompt_watermark - offset)
+        with self._prompt_seen_lock:
+            self._prompt_seen_pos = max(0, self._prompt_seen_pos - offset)
+
+        logger.debug(
+            "Buffer trimmed: discarded %d bytes (%.1f MB), "
+            "kept %d bytes (%.1f MB)",
+            discard, discard / (1024 * 1024),
+            len(self._buffer), len(self._buffer) / (1024 * 1024),
+        )
 
     async def send(
         self, text: str, timeout: float = DEFAULT_RESPONSE_TIMEOUT
@@ -1064,7 +1170,12 @@ class PtyBridge:
                 # Append to buffer
                 with self._buf_lock:
                     self._buffer.extend(data)
+                    self._trim_buffer_if_needed()
                 self._last_data_time = now
+
+                # Feed to persistent VirtualScreen for diff-based extraction
+                if self._task_screen is not None:
+                    self._task_screen.feed(data.decode("utf-8", errors="replace"))
 
                 # Track output bursts — consecutive reads within 500ms
                 # indicate active output (e.g., subprocess running).
@@ -1099,6 +1210,13 @@ class PtyBridge:
 
                 if elapsed >= 0.5:
                     prompt_detected, prompt_pos = self._check_prompt_detected_with_pos()
+                    if prompt_detected and prompt_pos > self._send_prompt_watermark:
+                        # Echo-aware prompt filter: don't complete if
+                        # the prompt is from an echo line
+                        prompt_detected = not self._is_prompt_from_echo(
+                            prompt_pos, self._sent_text,
+                            watermark=self._send_prompt_watermark,
+                        )
                     if prompt_detected and prompt_pos > self._send_prompt_watermark:
                         quiet_needed = 2.0
                         if self._last_data_time > 0:
@@ -1147,26 +1265,42 @@ class PtyBridge:
                 if elapsed >= 0.5:
                     prompt_detected, prompt_pos = self._check_prompt_detected_with_pos()
                     if prompt_detected and prompt_pos > self._task_send_start_pos:
-                        if self._prompt_first_seen == 0.0:
-                            self._prompt_first_seen = now
-                            self._prompt_stable_since = None
-                            self._last_stable_buffer_len = len(self._buffer)
-                        elif now - self._prompt_first_seen >= 2.0:
-                            if self._prompt_stable_since is None:
-                                self._prompt_stable_since = now
+                        # Echo-aware prompt filter: don't complete if
+                        # the prompt line matches echo pattern
+                        prompt_detected = not self._is_prompt_from_echo(
+                            prompt_pos, self._task_prompt,
+                            watermark=self._task_send_start_pos,
+                        )
+                    if prompt_detected and prompt_pos > self._task_send_start_pos:
+                        # Content gate: require at least 150 bytes of
+                        # new content after echo region before
+                        # considering completion (prevents premature
+                        # firing on long Chinese echo lines)
+                        with self._buf_lock:
+                            new_content_len = len(self._buffer) - self._task_send_start_pos
+                        if new_content_len < 150:
+                            prompt_detected = False
+                        else:
+                            if self._prompt_first_seen == 0.0:
+                                self._prompt_first_seen = now
+                                self._prompt_stable_since = None
                                 self._last_stable_buffer_len = len(self._buffer)
-                            cur_len = len(self._buffer)
-                            if cur_len > self._last_stable_buffer_len:
-                                self._prompt_stable_since = now
-                                self._last_stable_buffer_len = cur_len
-                            if self._prompt_stable_since is not None:
-                                if now - self._prompt_stable_since >= 3.0:
-                                    logger.info(
-                                        "Task completed — prompt stable for 3.0s after %.0fs",
-                                        elapsed,
-                                    )
-                                    self._task_completed.set()
-                                    self._task_result = self._extract_task_summary()
+                            elif now - self._prompt_first_seen >= 2.0:
+                                if self._prompt_stable_since is None:
+                                    self._prompt_stable_since = now
+                                    self._last_stable_buffer_len = len(self._buffer)
+                                cur_len = len(self._buffer)
+                                if cur_len > self._last_stable_buffer_len:
+                                    self._prompt_stable_since = now
+                                    self._last_stable_buffer_len = cur_len
+                                if self._prompt_stable_since is not None:
+                                    if now - self._prompt_stable_since >= 3.0:
+                                        logger.info(
+                                            "Task completed — prompt stable for 3.0s after %.0fs",
+                                            elapsed,
+                                        )
+                                        self._task_completed.set()
+                                        self._task_result = self._extract_task_summary()
                     else:
                         self._prompt_first_seen = 0.0
                         self._prompt_stable_since = 0.0
@@ -1887,14 +2021,105 @@ class PtyBridge:
         # Fallback: approximate
         return True, buf_len
 
-    def _cleanup(self):
-        """Close PTY master fd."""
-        self._ready = False
-        self._running = False
-        if self._master_fd is not None:
-            try:
-                os.close(self._master_fd)
-            except OSError:
-                pass
-            self._master_fd = None
-        self._process = None
+    # ── Echo-aware prompt validation ────────────────────────────────────
+
+    def _is_prompt_from_echo(
+        self, prompt_pos: int, sent_text: str, watermark: int = 0
+    ) -> bool:
+        """
+        Check if a detected prompt character (❯/▶/>) is from an echo line.
+
+        When the user's text is echoed back by the terminal, it appears as:
+            ❯ <user's sent_text>\n
+        The prompt character in this echo line is NOT a real completion
+        signal — it's just part of the terminal echo.
+
+        Strategy:
+          1. Decode the buffer region from the prompt position backward
+             to find the full line.
+          2. Check if the line containing the prompt char matches the
+             echo pattern: prompt_char + optional whitespace + sent_text.
+          3. Also check forward: if the echo line is the FIRST line after
+             the watermark, it's likely echo.
+
+        Returns True if the prompt appears to be from an echo line (i.e.,
+        should be IGNORED as a completion signal).
+        """
+        if not sent_text:
+            return False
+
+        with self._buf_lock:
+            if prompt_pos >= len(self._buffer):
+                return False
+            # Grab up to 2048 bytes before the prompt position
+            start = max(0, prompt_pos - 512)
+            end = min(len(self._buffer), prompt_pos + 2048)
+            region = bytes(self._buffer[start:end])
+
+        try:
+            decoded = region.decode("utf-8", errors="replace")
+        except Exception:
+            return False
+
+        # Find the line containing the prompt character
+        # (search backward from the prompt position within this region)
+        prompt_offset_in_region = prompt_pos - start
+        # Find beginning of this line
+        line_start = decoded.rfind("\n", 0, prompt_offset_in_region)
+        if line_start < 0:
+            line_start = 0
+        else:
+            line_start += 1  # skip the newline
+        # Find end of this line
+        line_end = decoded.find("\n", prompt_offset_in_region)
+        if line_end < 0:
+            line_end = len(decoded)
+
+        prompt_line = decoded[line_start:line_end].strip()
+        if not prompt_line:
+            return False
+
+        # Strip ANSI from the line for comparison
+        from output_parser import strip_ansi as _strip_ansi
+        clean_line = _strip_ansi(prompt_line)
+
+        # Check echo pattern: prompt_char + optional whitespace + sent_text
+        # The echo line typically looks like:  ❯ 你好世界
+        # or with ANSI:  \x1b[1m\x1b[35m❯\x1b[39m\x1b[22m 你好世界
+        for prompt_char in ("❯", ">", "▶"):
+            # Pattern: starts with prompt char, then the sent text
+            # (allow for ANSI rendering that puts the prompt at column 0
+            # or prepended by whitespace)
+            if clean_line.startswith(prompt_char):
+                after_prompt = clean_line[len(prompt_char):].lstrip()
+                # Check if this is the sent text
+                if after_prompt == sent_text.strip():
+                    logger.debug(
+                        "_is_prompt_from_echo: TRUE — prompt line matches echo: %r",
+                        clean_line[:80],
+                    )
+                    return True
+                # Also check partial match for long texts that may get
+                # truncated by terminal width
+                if len(sent_text) > 30 and after_prompt and sent_text.strip().startswith(after_prompt[:20]):
+                    logger.debug(
+                        "_is_prompt_from_echo: TRUE — partial echo match (long text)",
+                    )
+                    return True
+
+            # Pattern: whitespace prefix (VirtualScreen rendering may
+            # put the prompt at a non-zero column after rendering)
+            if clean_line.endswith(sent_text.strip()) and prompt_char in clean_line:
+                # Check that the prompt char appears before the sent_text
+                pc_idx = clean_line.find(prompt_char)
+                sent_idx = clean_line.find(sent_text.strip())
+                if 0 <= pc_idx < sent_idx:
+                    logger.debug(
+                        "_is_prompt_from_echo: TRUE — line ends with sent_text "
+                        "and contains prompt char",
+                    )
+                    return True
+
+        return False
+
+    # _cleanup is defined above (after stop())

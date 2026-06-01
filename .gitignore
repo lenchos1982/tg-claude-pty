@@ -45,3 +45,8 @@ MEMORY.md
 # Runtime directories
 .claude/
 .openclaw/
+
+# Backups and local test scripts
+backup-*/
+test_*.py
+run_bot.sh

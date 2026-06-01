@@ -1153,6 +1153,55 @@ Contributions are welcome! Areas that could use improvement:
 - **Monitoring endpoints** (health check, metrics)
 - **More robust output parsing** (for edge cases in VirtualScreen)
 
+---
+
+## 2026-06-01 Fix: 核心 Bug 修復
+
+### Bug 1 修復：Echo 截斷正常回覆
+- **根因**：`send_task()` 寫入 PTY 後，終端機 echo 行中的 ❯ 被 reader thread 的 prompt
+  檢測邏輯誤判為完成訊號，導致任務在 Claude 真正回覆前就提前結束。
+- **修復**：
+  - 新增 `_is_prompt_from_echo()` 方法，透過比對 prompt 行是否匹配 "❯ + 用戶輸入"
+    模式來識別 echo prompt，將其從完成檢測中排除。
+  - 新增 content gate：任務完成前要求至少 150 bytes 新內容（防止長中文 echo
+    超過 200 bytes 閾值導致漏判）。
+  - 取代舊的固定 200-byte 距離閾值 heuristic（對 UTF-8 長中文提示不可靠）。
+
+### Bug 2 修復：歷史回覆疊加到新回覆
+- **根因**：`send_task()` 的 VirtualScreen snapshot 在 PTY 寫入前取得，不包含 echo
+  內容。reader thread 將 echo 寫入 VirtualScreen 後，snapshot 已過時，導致
+  `get_new_text_since()` 可能把舊 session 內容也當作「新增」。
+- **修復**：echo skip 成功後立即重新 snapshot VirtualScreen，確保 diff 基線
+  在 echo 區域之後。
+- **備援機制**：`_extract_task_summary()` 新增 raw buffer fallback — 當
+  VirtualScreen diff 結果過短時，改用原始 PTY buffer 提取。
+
+### Bug 3 確認與修復：Buffer 無限增長
+- **結論**：屬實。`_buffer` (bytearray) 自 PTY 啟動後從未裁剪。長時間 session
+  可增長至數十 MB。
+- **修復**：
+  - 新增 `MAX_BUFFER_BYTES = 10 MiB` 上限
+  - `_trim_buffer_if_needed()` 在 reader thread 每次 append 時檢查並裁剪
+    過舊前綴，同時調整所有 positional references。
+  - 直接影響 correctness 的 prompt 檢測只掃描最後 2048 bytes，不受裁剪影響。
+
+### Bug 4 分析
+- 無法正常收到回覆的問題主要由 Bug 1 導致（echo 觸發 premature completion，
+  回傳空白內容）。Bug 1 修復後應已解決。
+- 若 VirtualScreen diff 遺漏輸出，raw buffer fallback 機制提供備援路徑。
+
+### 其他修復
+- 補回遺失的 `_cleanup()` 方法（舊程式碼多處調用但從未定義，會觸發
+  `AttributeError`）。
+- 更新 `.gitignore` 排除 backup 目錄和測試腳本。
+
+### 改動檔案
+- `pty_bridge.py`：核心修復
+- `ansi_renderer.py`：新增 `snapshot()` / `get_new_text_since()`（已存在於
+  工作目錄，本次一併提交）
+- `README.md`：本文檔
+- `.gitignore`：排除規則更新
+
 ### License
 
 This project is released under the MIT License. See [LICENSE](LICENSE) for details.
