@@ -172,6 +172,13 @@ class PtyBridge:
         self._task_screen: Optional[VirtualScreen] = None
         self._task_screen_snapshot: Optional[list] = None
 
+        # claude -p subprocess guard: when True, the reader thread MUST NOT
+        # trigger task completion via prompt stability detection. Only the
+        # claude -p background thread is allowed to set _task_completed.
+        # Prevents race between Path A (reader prompt stability) and
+        # Path B (claude -p subprocess) — see send_task().
+        self._claude_p_running = False
+
         # Async bridge (set during start())
         self._loop: Optional[asyncio.AbstractEventLoop] = None
 
@@ -279,6 +286,7 @@ class PtyBridge:
         self._prompt_stable_since = 0.0
         self._last_stable_buffer_len = 0
         self._prompt_ready_event.set()  # Reset to ready so next send doesn't block
+        self._claude_p_running = False
         # Clear VirtualScreen grid to prevent stale content from
         # previous session leaking into diff-based extraction.
         if self._task_screen is not None:
@@ -664,8 +672,15 @@ class PtyBridge:
                 )
                 self._task_result = self._extract_task_summary()
             finally:
+                self._claude_p_running = False
                 self._task_completed.set()
 
+        # ── Disable reader-thread task completion ──
+        # The reader thread has its own prompt-stability-based task
+        # completion path.  While claude -p is running, we must
+        # prevent it from racing ahead and setting _task_completed
+        # with stale PTY-buffer content before our subprocess finishes.
+        self._claude_p_running = True
         t = threading.Thread(target=_run_claude_p_thread, daemon=True)
         t.start()
 
@@ -1356,7 +1371,15 @@ class PtyBridge:
                     )
 
             # ── Task completion detection (prompt stability) ──────
-            if self._task_send_start_pos > 0 and not self._task_completed.is_set():
+            # IMPORTANT: when claude -p is running (send_task mode),
+            # we must NOT use prompt stability to detect completion.
+            # The claude -p background thread is the sole authority
+            # for setting _task_completed.  Allowing the reader to
+            # race ahead causes stale/echo PTY-buffer content to be
+            # sent to the user before claude -p finishes.
+            if (self._task_send_start_pos > 0
+                    and not self._task_completed.is_set()
+                    and not self._claude_p_running):
                 elapsed = now - self._task_start_time if self._task_start_time > 0 else 0.0
 
                 if self._output_burst_count >= 3:
