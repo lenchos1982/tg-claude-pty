@@ -467,6 +467,10 @@ class PtyBridge:
         confirmation string. Callers must monitor _task_completed event
         to know when the task finishes.
 
+        Output extraction uses claude -p --continue (non-interactive,
+        pure-text output) instead of scraping the TUI-filled PTY buffer.
+        If the subprocess fails, falls back to PTY buffer extraction.
+
         Args:
             text: The task prompt to send to Claude.
 
@@ -480,10 +484,10 @@ class PtyBridge:
             raise RuntimeError("PtyBridge is not ready. Call start() first.")
 
         # Wait for prompt-ready to prevent input stacking.
-        # Skip if we're still in startup phase — Claude may not have
+        # Skip if we're still in startup phase \u2014 Claude may not have
         # signalled prompt-ready yet but is actually at its prompt.
         if not self._prompt_ready_event.is_set() and time.monotonic() >= self._startup_until:
-            logger.info("Claude not at prompt — waiting for it to finish...")
+            logger.info("Claude not at prompt \u2014 waiting for it to finish...")
             self._wait_for_prompt_ready(timeout=60.0)
 
         # Prepare task mode state
@@ -559,34 +563,111 @@ class PtyBridge:
                             if new_pos <= len(self._buffer):
                                 self._task_send_start_pos = new_pos
                         # Reset prompt detection state in reader thread.
-                        # The reader thread may have already detected a prompt
-                        # character (❯) from the partial echo line and started
-                        # the stability timer. After advancing past the echo,
-                        # reset the timer so prompt detection restarts from
-                        # the new position — otherwise the stale timer would
-                        # fire after 5s regardless of real completion.
                         self._prompt_first_seen = 0.0
                         self._prompt_stable_since = 0.0
                         self._last_stable_buffer_len = 0
-                        # ── Re-snapshot VirtualScreen after echo skip ──
-                        # The initial snapshot (taken before the PTY write)
-                        # doesn't include the echo line. After the reader
-                        # thread has fed the echo data, re-snapshot here
-                        # so get_new_text_since() correctly starts after
-                        # the echo region — preventing old screen content
-                        # from appearing as "new" in the task result.
+                        # Re-snapshot VirtualScreen after echo skip
                         if self._task_screen is not None:
                             self._task_screen_snapshot = self._task_screen.snapshot()
-                        # ── Re-clear task completion after echo skip ──
-                        # The reader thread runs concurrently and may have
-                        # set _task_completed from detecting the echo's ❯
-                        # (e.g. TUI-framed echo > 150 bytes passes content
-                        # gate).  Re-clearing here mirrors send()'s pattern
-                        # of re-clearing _response_event after echo skip.
+                        # Re-clear task completion after echo skip
                         self._task_completed.clear()
                         logger.debug("send_task: echo skipped for '%s'", text[:50])
                     break
             time.sleep(0.15)
+
+        # ── Launch claude -p --continue in background thread ──
+        # Instead of relying on the reader thread's prompt stability
+        # detection + VirtualScreen diff (which breaks on TUI-heavy
+        # PTY output), we run claude -p --continue as a subprocess.
+        # This gives us clean, pure-text output directly from Claude's
+        # non-interactive mode, which shares the same session context
+        # via --continue (reads ~/.claude/history.jsonl).
+        from config import TASK_DEFAULT_TIMEOUT
+
+        claude_bin = self._claude_bin
+        # Build claude -p command using the same settings as the PTY session
+        settings_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            ".claude",
+            "settings.local.json",
+        )
+        cmd = [
+            claude_bin,
+            "-p",
+            "--continue",
+            "--output-format", "text",
+            "--permission-mode", "auto",
+            "--settings", settings_path,
+            "--system-prompt-file", "/root/chuxi/CLAUDE.md",
+            text,  # prompt as positional argument
+        ]
+        timeout = TASK_DEFAULT_TIMEOUT
+        task_prompt = text
+        task_start_pos = self._task_send_start_pos
+        master_fd = self._master_fd
+
+        def _run_claude_p_thread():
+            """Run claude -p --continue in a thread, capture stdout."""
+            chuxi_dir = "/root/chuxi"
+            clean_env = {
+                k: v
+                for k, v in os.environ.items()
+                if not k.startswith("CLAUDE_CODE_")
+                and k not in ("CLAUDECODE", "CLAUDE_AGENT_SDK_VERSION")
+            }
+            try:
+                proc = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                    cwd=chuxi_dir,
+                    env=clean_env,
+                )
+                if proc.returncode == 0 and proc.stdout.strip():
+                    # Success: use subprocess stdout directly
+                    result_text = proc.stdout.strip()
+                    logger.info(
+                        "claude -p completed — %d chars, %d lines",
+                        len(result_text),
+                        result_text.count("\n") + 1,
+                    )
+                    # Press Enter on PTY to keep the session alive and
+                    # let Claude process the message in interactive mode too.
+                    # The PTY write already sent the text; this subprocess
+                    # just reaps the answer via --continue. The PTY will
+                    # independently finish processing — but since we don't
+                    # extract from PTY, that's fine (it just keeps session
+                    # context in sync).
+                    self._task_result = result_text
+                else:
+                    # Non-zero exit or empty stdout — fall back to PTY
+                    logger.warning(
+                        "claude -p failed (rc=%d, stderr=%r) — "
+                        "falling back to PTY buffer extraction",
+                        proc.returncode,
+                        proc.stderr[:200] if proc.stderr else "",
+                    )
+                    self._task_result = self._extract_task_summary()
+            except subprocess.TimeoutExpired:
+                logger.warning(
+                    "claude -p timed out after %.0fs — "
+                    "falling back to PTY buffer extraction",
+                    timeout,
+                )
+                self._task_result = self._extract_task_summary()
+            except Exception as e:
+                logger.error(
+                    "claude -p subprocess error: %s — "
+                    "falling back to PTY buffer extraction",
+                    e,
+                )
+                self._task_result = self._extract_task_summary()
+            finally:
+                self._task_completed.set()
+
+        t = threading.Thread(target=_run_claude_p_thread, daemon=True)
+        t.start()
 
         return "\u2705 \u4efb\u52d9\u5df2\u63a5\u6536\uff0c\u5c07\u5728\u80cc\u666f\u57f7\u884c"
 
