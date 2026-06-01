@@ -279,6 +279,12 @@ class PtyBridge:
         self._prompt_stable_since = 0.0
         self._last_stable_buffer_len = 0
         self._prompt_ready_event.set()  # Reset to ready so next send doesn't block
+        # Clear VirtualScreen grid to prevent stale content from
+        # previous session leaking into diff-based extraction.
+        if self._task_screen is not None:
+            self._task_screen._clear_screen()
+            self._task_screen._row = 0
+            self._task_screen._col = 0
 
     # ── Start / Stop ────────────────────────────────────────────────────
 
@@ -493,6 +499,18 @@ class PtyBridge:
         with self._buf_lock:
             self._task_send_start_pos = len(self._buffer)
 
+        # ── Reset VirtualScreen grid before snapshot ──
+        # The persistent _task_screen accumulates grid state from every
+        # task. If Claude's ANSI cursor positioning writes to rows that
+        # were populated by previous tasks, get_new_text_since() may miss
+        # the new content (Bug 1: truncated results) or include stale
+        # content from earlier tasks (Bug 2: historical output leaking).
+        # Clearing the grid before each snapshot ensures the diff captures
+        # only the current task's output from row 0 onward.
+        if self._task_screen is not None:
+            self._task_screen._clear_screen()
+            self._task_screen._row = 0
+            self._task_screen._col = 0
         # Snapshot VirtualScreen for diff-based content extraction
         self._task_screen_snapshot = self._task_screen.snapshot() if self._task_screen else None
 
@@ -559,6 +577,13 @@ class PtyBridge:
                         # from appearing as "new" in the task result.
                         if self._task_screen is not None:
                             self._task_screen_snapshot = self._task_screen.snapshot()
+                        # ── Re-clear task completion after echo skip ──
+                        # The reader thread runs concurrently and may have
+                        # set _task_completed from detecting the echo's ❯
+                        # (e.g. TUI-framed echo > 150 bytes passes content
+                        # gate).  Re-clearing here mirrors send()'s pattern
+                        # of re-clearing _response_event after echo skip.
+                        self._task_completed.clear()
                         logger.debug("send_task: echo skipped for '%s'", text[:50])
                     break
             time.sleep(0.15)
