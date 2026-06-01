@@ -321,7 +321,7 @@ class PtyBridge:
         # Build claude command with optional session ID
         # Non-bare mode: Claude loads ~/.claude/CLAUDE.md (global dev rules)
         # in addition to --system-prompt-file. The two merge cleanly —
-        # /root/chuxi/CLAUDE.md sets output format rules, ~/.claude/CLAUDE.md
+        # /root/tg-claude-pty/.claude/CLAUDE.md sets output format rules, ~/.claude/CLAUDE.md
         # sets coding discipline rules. No conflict.
         # --settings: explicitly point to project-level settings file so
         #   permissions.allow rules are loaded even in --bare mode.
@@ -337,7 +337,7 @@ class PtyBridge:
             self._claude_bin,
             "--permission-mode", "auto",
             "--settings", settings_path,
-            "--system-prompt-file", "/root/chuxi/CLAUDE.md",
+            "--system-prompt-file", "/root/tg-claude-pty/.claude/CLAUDE.md",
         ]
         if self._session_id:
             cmd.extend(["--session-id", self._session_id])
@@ -606,7 +606,7 @@ class PtyBridge:
             "--output-format", "text",
             "--permission-mode", "auto",
             "--settings", settings_path,
-            "--system-prompt-file", "/root/chuxi/CLAUDE.md",
+            "--system-prompt-file", "/root/tg-claude-pty/.claude/CLAUDE.md",
             text,  # prompt as positional argument
         ]
         timeout = TASK_DEFAULT_TIMEOUT
