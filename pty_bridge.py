@@ -321,7 +321,7 @@ class PtyBridge:
         # Build claude command with optional session ID
         # Non-bare mode: Claude loads ~/.claude/CLAUDE.md (global dev rules)
         # in addition to --system-prompt-file. The two merge cleanly —
-        # /root/tg-claude-pty/.claude/CLAUDE.md sets output format rules, ~/.claude/CLAUDE.md
+        # /root/chuxi/CLAUDE.md sets output format rules, ~/.claude/CLAUDE.md
         # sets coding discipline rules. No conflict.
         # --settings: explicitly point to project-level settings file so
         #   permissions.allow rules are loaded even in --bare mode.
@@ -337,7 +337,7 @@ class PtyBridge:
             self._claude_bin,
             "--permission-mode", "auto",
             "--settings", settings_path,
-            "--system-prompt-file", "/root/tg-claude-pty/.claude/CLAUDE.md",
+            "--system-prompt-file", "/root/chuxi/CLAUDE.md",
         ]
         if self._session_id:
             cmd.extend(["--session-id", self._session_id])
@@ -509,7 +509,14 @@ class PtyBridge:
 
         # Record buffer start position
         with self._buf_lock:
-            self._task_send_start_pos = len(self._buffer)
+            echo_start_pos = len(self._buffer)
+        # ── IMPORTANT: do NOT set self._task_send_start_pos yet! ──
+        # The reader thread uses _task_send_start_pos > 0 as the gate
+        # for enabling its prompt-stability task completion path.
+        # We must keep it at 0 until _claude_p_running is True
+        # (set after echo skip below), otherwise the reader thread can
+        # race ahead and fire Path A before Path B (claude -p) completes.
+        # Use the local echo_start_pos for echo skip calculations.
 
         # ── Reset VirtualScreen grid before snapshot ──
         # The persistent _task_screen accumulates grid state from every
@@ -549,10 +556,10 @@ class PtyBridge:
                 break
             with self._buf_lock:
                 cur_len = len(self._buffer)
-            new_bytes_count = cur_len - self._task_send_start_pos
+            new_bytes_count = cur_len - echo_start_pos
             if new_bytes_count >= len(text.encode("utf-8", errors="replace")) + 1:
                 with self._buf_lock:
-                    new_bytes = bytes(self._buffer[self._task_send_start_pos:cur_len])
+                    new_bytes = bytes(self._buffer[echo_start_pos:cur_len])
                 if self._echo_detected(new_bytes, text):
                     raw_content = new_bytes.decode("utf-8", errors="replace")
                     echo_end_marker = -1
@@ -564,12 +571,12 @@ class PtyBridge:
                     if echo_end_marker >= 0:
                         nl_after = raw_content.find("\n", echo_end_marker)
                         if nl_after >= 0:
-                            new_pos = self._task_send_start_pos + nl_after + 1
+                            new_pos = echo_start_pos + nl_after + 1
                         else:
-                            new_pos = self._task_send_start_pos + echo_end_marker
+                            new_pos = echo_start_pos + echo_end_marker
                         with self._buf_lock:
                             if new_pos <= len(self._buffer):
-                                self._task_send_start_pos = new_pos
+                                echo_start_pos = new_pos
                         # Reset prompt detection state in reader thread.
                         self._prompt_first_seen = 0.0
                         self._prompt_stable_since = 0.0
@@ -606,7 +613,7 @@ class PtyBridge:
             "--output-format", "text",
             "--permission-mode", "auto",
             "--settings", settings_path,
-            "--system-prompt-file", "/root/tg-claude-pty/.claude/CLAUDE.md",
+            "--system-prompt-file", "/root/chuxi/CLAUDE.md",
             text,  # prompt as positional argument
         ]
         timeout = TASK_DEFAULT_TIMEOUT
@@ -683,11 +690,18 @@ class PtyBridge:
         # completion path.  While claude -p is running, we must
         # prevent it from racing ahead and setting _task_completed
         # with stale PTY-buffer content before our subprocess finishes.
+        # ── Enable reader-thread task completion path ──
+        # Only now — AFTER _claude_p_running is True — do we set
+        # _task_send_start_pos to a non-zero value.  This is the
+        # definitive fix for the Path A / Path B race: the reader
+        # thread cannot enter its task-completion block before
+        # the claude -p guard is active.
+        self._task_send_start_pos = echo_start_pos
         self._claude_p_running = True
         logger.warning(
-            "DIAG: _claude_p_running = True (send_task, after echo skip) — "
-            "task_start_pos=%d first_seen=%.1f",
-            self._task_send_start_pos, self._prompt_first_seen,
+            "DIAG: _task_send_start_pos=%d _claude_p_running=True (send_task, after echo skip) — "
+            "first_seen=%.1f",
+            echo_start_pos, self._prompt_first_seen,
         )
         # ── Kill any in-flight prompt stability timer ──
         # The reader thread may have entered the task-completion block
