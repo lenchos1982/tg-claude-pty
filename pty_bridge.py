@@ -672,6 +672,9 @@ class PtyBridge:
                 )
                 self._task_result = self._extract_task_summary()
             finally:
+                logger.debug(
+                    "DIAG: _run_claude_p_thread finally — setting claude_p=False, task_completed=True"
+                )
                 self._claude_p_running = False
                 self._task_completed.set()
 
@@ -681,6 +684,11 @@ class PtyBridge:
         # prevent it from racing ahead and setting _task_completed
         # with stale PTY-buffer content before our subprocess finishes.
         self._claude_p_running = True
+        logger.debug(
+            "DIAG: _claude_p_running = True (send_task, after echo skip) — "
+            "task_start_pos=%d first_seen=%.1f",
+            self._task_send_start_pos, self._prompt_first_seen,
+        )
         # ── Kill any in-flight prompt stability timer ──
         # The reader thread may have entered the task-completion block
         # and started its stability timer during the brief window
@@ -1389,6 +1397,16 @@ class PtyBridge:
             if (self._task_send_start_pos > 0
                     and not self._task_completed.is_set()
                     and not self._claude_p_running):
+                # ── DIAGNOSTIC: log entry into task completion block ──
+                logger.debug(
+                    "DIAG: entered task-completion block — "
+                    "send_start=%d completed=%s claude_p=%s first_seen=%.1f stable_since=%s",
+                    self._task_send_start_pos,
+                    self._task_completed.is_set(),
+                    self._claude_p_running,
+                    self._prompt_first_seen,
+                    "%.1f" % self._prompt_stable_since if self._prompt_stable_since else "None",
+                )
                 elapsed = now - self._task_start_time if self._task_start_time > 0 else 0.0
 
                 if self._output_burst_count >= 3:
@@ -1440,10 +1458,21 @@ class PtyBridge:
                                         # activated.  If claude -p is now running,
                                         # abort and reset the stale timer.
                                         if self._claude_p_running:
+                                            logger.debug(
+                                                "DIAG: inner guard CAUGHT — claude_p=True, resetting timer "
+                                                "(first_seen=%.1f elapsed=%.0f)",
+                                                self._prompt_first_seen, elapsed,
+                                            )
                                             self._prompt_first_seen = 0.0
                                             self._prompt_stable_since = 0.0
                                             self._last_stable_buffer_len = 0
                                         else:
+                                            logger.debug(
+                                                "DIAG: inner guard PASSED — claude_p=False, FIRING "
+                                                "(first_seen=%.1f elapsed=%.0f completed=%s)",
+                                                self._prompt_first_seen, elapsed,
+                                                self._task_completed.is_set(),
+                                            )
                                             logger.info(
                                                 "Task completed — prompt stable for 3.0s after %.0fs",
                                                 elapsed,
