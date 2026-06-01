@@ -681,6 +681,15 @@ class PtyBridge:
         # prevent it from racing ahead and setting _task_completed
         # with stale PTY-buffer content before our subprocess finishes.
         self._claude_p_running = True
+        # ── Kill any in-flight prompt stability timer ──
+        # The reader thread may have entered the task-completion block
+        # and started its stability timer during the brief window
+        # between echo skip and this guard activation.  Resetting
+        # these ensures the timer is dead even if _prompt_first_seen
+        # was already set.
+        self._prompt_first_seen = 0.0
+        self._prompt_stable_since = 0.0
+        self._last_stable_buffer_len = 0
         t = threading.Thread(target=_run_claude_p_thread, daemon=True)
         t.start()
 
@@ -1424,12 +1433,23 @@ class PtyBridge:
                                     self._last_stable_buffer_len = cur_len
                                 if self._prompt_stable_since is not None:
                                     if now - self._prompt_stable_since >= 3.0:
-                                        logger.info(
-                                            "Task completed — prompt stable for 3.0s after %.0fs",
-                                            elapsed,
-                                        )
-                                        self._task_completed.set()
-                                        self._task_result = self._extract_task_summary()
+                                        # ── Belt-and-suspenders guard ──
+                                        # Re-check _claude_p_running before firing.
+                                        # The outer if-block may have been entered
+                                        # during a brief window before the guard was
+                                        # activated.  If claude -p is now running,
+                                        # abort and reset the stale timer.
+                                        if self._claude_p_running:
+                                            self._prompt_first_seen = 0.0
+                                            self._prompt_stable_since = 0.0
+                                            self._last_stable_buffer_len = 0
+                                        else:
+                                            logger.info(
+                                                "Task completed — prompt stable for 3.0s after %.0fs",
+                                                elapsed,
+                                            )
+                                            self._task_completed.set()
+                                            self._task_result = self._extract_task_summary()
                     else:
                         self._prompt_first_seen = 0.0
                         self._prompt_stable_since = 0.0
