@@ -672,7 +672,7 @@ class PtyBridge:
                 )
                 self._task_result = self._extract_task_summary()
             finally:
-                logger.debug(
+                logger.warning(
                     "DIAG: _run_claude_p_thread finally — setting claude_p=False, task_completed=True"
                 )
                 self._claude_p_running = False
@@ -684,7 +684,7 @@ class PtyBridge:
         # prevent it from racing ahead and setting _task_completed
         # with stale PTY-buffer content before our subprocess finishes.
         self._claude_p_running = True
-        logger.debug(
+        logger.warning(
             "DIAG: _claude_p_running = True (send_task, after echo skip) — "
             "task_start_pos=%d first_seen=%.1f",
             self._task_send_start_pos, self._prompt_first_seen,
@@ -883,11 +883,26 @@ class PtyBridge:
             if raw_bytes:
                 from output_parser import extract_content
                 raw_text = extract_content(raw_bytes.decode("utf-8", errors="replace"))
-                # Strip prompt line (echo) from the beginning
-                if self._task_prompt and raw_text.startswith(self._task_prompt[:min(len(self._task_prompt), 20)]):
-                    nl = raw_text.find("\n")
-                    if nl > 0:
-                        raw_text = raw_text[nl + 1:]
+                # Strip prompt line (echo) from the beginning.
+                # Echo format: "❯ <sent_text>\n" or "> <sent_text>\n"
+                # The old check only matched raw_text starting with sent_text
+                # directly, but the PTY always prepends a prompt character.
+                if self._task_prompt:
+                    stripped = raw_text.lstrip()
+                    for pc in ("❯", ">", "▶"):
+                        prefix = pc + " " + self._task_prompt
+                        if stripped.startswith(prefix):
+                            nl = raw_text.find("\n")
+                            if nl > 0:
+                                raw_text = raw_text[nl + 1:]
+                            break
+                    else:
+                        # Fallback: sent_text may appear without prompt char
+                        # (e.g. VirtualScreen rendering artifacts)
+                        if raw_text.startswith(self._task_prompt[:min(len(self._task_prompt), 20)]):
+                            nl = raw_text.find("\n")
+                            if nl > 0:
+                                raw_text = raw_text[nl + 1:]
                 # Re-apply clean_output to the raw fallback
                 fallback_cleaned = self._clean_output(raw_text)
                 if fallback_cleaned and len(fallback_cleaned) > len(cleaned):
@@ -1398,7 +1413,7 @@ class PtyBridge:
                     and not self._task_completed.is_set()
                     and not self._claude_p_running):
                 # ── DIAGNOSTIC: log entry into task completion block ──
-                logger.debug(
+                logger.warning(
                     "DIAG: entered task-completion block — "
                     "send_start=%d completed=%s claude_p=%s first_seen=%.1f stable_since=%s",
                     self._task_send_start_pos,
@@ -1458,7 +1473,7 @@ class PtyBridge:
                                         # activated.  If claude -p is now running,
                                         # abort and reset the stale timer.
                                         if self._claude_p_running:
-                                            logger.debug(
+                                            logger.warning(
                                                 "DIAG: inner guard CAUGHT — claude_p=True, resetting timer "
                                                 "(first_seen=%.1f elapsed=%.0f)",
                                                 self._prompt_first_seen, elapsed,
@@ -1467,7 +1482,7 @@ class PtyBridge:
                                             self._prompt_stable_since = 0.0
                                             self._last_stable_buffer_len = 0
                                         else:
-                                            logger.debug(
+                                            logger.warning(
                                                 "DIAG: inner guard PASSED — claude_p=False, FIRING "
                                                 "(first_seen=%.1f elapsed=%.0f completed=%s)",
                                                 self._prompt_first_seen, elapsed,
